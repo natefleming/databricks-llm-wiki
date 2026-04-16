@@ -120,14 +120,21 @@ async def api_stats(request: Request = None) -> JSONResponse:
 @app.get("/api/graph")
 async def api_graph(center: str | None = None, request: Request = None) -> JSONResponse:
     """Get knowledge graph data for Cytoscape.js."""
-    delta = request.app.state.delta_store
-    pages = delta.list_pages(limit=200)
-    nodes = [{"data": {"id": p.page_id, "label": p.title, "type": p.page_type.value}} for p in pages]
-    edges = []
-    for p in pages:
-        for link in p.wikilinks:
-            edges.append({"data": {"source": p.page_id, "target": link}})
-    return JSONResponse({"nodes": nodes, "edges": edges})
+    try:
+        delta = request.app.state.delta_store
+        pages = delta.list_pages(limit=200)
+        page_ids = {p.page_id for p in pages}
+        nodes = [{"data": {"id": p.page_id, "label": p.title, "type": p.page_type.value}} for p in pages]
+        # Only include edges where both source and target exist as nodes
+        edges = []
+        for p in pages:
+            for link in p.wikilinks:
+                if link in page_ids:
+                    edges.append({"data": {"source": p.page_id, "target": link}})
+        return JSONResponse({"nodes": nodes, "edges": edges})
+    except Exception as e:
+        logger.error("Graph API failed", error=str(e))
+        return JSONResponse({"nodes": [], "edges": [], "error": str(e)})
 
 
 # ──────────────────────────────────────────────

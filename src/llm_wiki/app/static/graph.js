@@ -15,12 +15,26 @@ async function initGraph(centerPageId) {
         ? `/api/graph?center=${encodeURIComponent(centerPageId)}`
         : '/api/graph';
 
+    const container = document.getElementById('cy');
+
     try {
-        const resp = await fetch(url);
+        container.innerHTML = '<p style="padding:2rem;color:#666;">Loading graph...</p>';
+
+        const resp = await fetch(url, { credentials: 'include' });
+        if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+        }
         const data = await resp.json();
 
+        if (!data.nodes || data.nodes.length === 0) {
+            container.innerHTML = '<p style="padding:2rem;color:#666;">No pages to display in graph.</p>';
+            return;
+        }
+
+        container.innerHTML = '';
+
         cy = cytoscape({
-            container: document.getElementById('cy'),
+            container: container,
             elements: [...data.nodes, ...data.edges],
 
             style: [
@@ -88,8 +102,9 @@ async function initGraph(centerPageId) {
         });
 
     } catch (e) {
-        document.getElementById('cy').innerHTML =
-            '<p style="padding:2rem;color:#666;">Could not load graph data.</p>';
+        console.error('Graph init failed:', e);
+        container.innerHTML =
+            `<p style="padding:2rem;color:#666;">Could not load graph data: ${e.message}</p>`;
     }
 }
 
