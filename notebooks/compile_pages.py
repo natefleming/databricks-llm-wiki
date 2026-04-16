@@ -106,10 +106,11 @@ Write a comprehensive wiki page with cross-references using [[slug]] wikilinks."
         for m in messages
     ]
 
+    w._config.retry_timeout_seconds = 600
     response = w.serving_endpoints.query(
         name=llm_endpoint,
         messages=sdk_messages,
-        max_tokens=4096,
+        max_tokens=3000,
         temperature=0.3,
     )
 

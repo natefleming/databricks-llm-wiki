@@ -70,8 +70,7 @@ class DeltaStore:
     def _execute(self, sql: str) -> list[list[Any]]:
         """Execute a SQL statement and return rows.
 
-        Uses the Statement Execution API which auto-discovers a warehouse
-        when warehouse_id is not set.
+        Uses the Statement Execution API with the configured warehouse.
 
         Args:
             sql: SQL statement to execute.
@@ -80,11 +79,22 @@ class DeltaStore:
             List of rows, each row is a list of column values.
         """
         try:
-            kwargs: dict[str, Any] = {"statement": sql, "catalog": self.catalog}
-            if self._warehouse_id:
-                kwargs["warehouse_id"] = self._warehouse_id
+            response = self._client.statement_execution.execute_statement(
+                statement=sql,
+                warehouse_id=self._warehouse_id,
+                catalog=self.catalog,
+                schema=self.wiki_schema,
+                wait_timeout="30s",
+            )
 
-            response = self._client.statement_execution.execute_statement(**kwargs)
+            # Handle PENDING/RUNNING states
+            if hasattr(response, "status") and response.status:
+                state = getattr(response.status, "state", None)
+                if state and state.value in ("FAILED", "CANCELED", "CLOSED"):
+                    error = getattr(response.status, "error", None)
+                    msg = getattr(error, "message", str(state)) if error else str(state)
+                    logger.error("SQL statement failed", state=str(state), error=msg)
+                    return []
 
             if response.result and response.result.data_array:
                 return response.result.data_array
@@ -442,16 +452,20 @@ class DeltaStore:
 
     @staticmethod
     def _row_to_page(row: list) -> Page:
-        """Convert a result row to a Page model."""
+        """Convert a result row to a Page model.
+
+        The Statement Execution API returns all values as strings,
+        including arrays (as JSON strings). This method handles parsing.
+        """
         return Page(
             page_id=row[0] or "",
             title=row[1] or "",
             page_type=row[2] or "concept",
             content_markdown=row[3] or "",
             confidence=row[4] or "low",
-            sources=row[5] or [],
-            related=row[6] or [],
-            tags=row[7] or [],
+            sources=_parse_array(row[5]),
+            related=_parse_array(row[6]),
+            tags=_parse_array(row[7]),
             freshness_tier=row[8] or "monthly",
             content_hash=row[9] or "",
             created_at=row[10],
@@ -463,3 +477,30 @@ class DeltaStore:
 def _esc(value: str) -> str:
     """Escape single quotes for SQL string literals."""
     return value.replace("'", "''")
+
+
+def _parse_array(value: Any) -> list[str]:
+    """Parse an array value from Statement Execution API results.
+
+    The API may return arrays as Python lists, JSON strings, or None.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or value == "[]":
+            return []
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(v) for v in parsed]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Try comma-separated format: [val1, val2]
+        if value.startswith("[") and value.endswith("]"):
+            inner = value[1:-1].strip()
+            if inner:
+                return [v.strip().strip('"').strip("'") for v in inner.split(",")]
+    return []
