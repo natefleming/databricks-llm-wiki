@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}Knowledge Graph - LLM Wiki{% endblock %}
+
+{% block head %}
+<script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="graph-container">
+    <div class="graph-header">
+        <h1>Knowledge Graph{% if center %} - {{ center|replace('-', ' ')|title }}{% endif %}</h1>
+        <div class="graph-controls">
+            <button onclick="resetLayout()" class="btn btn-sm">Reset Layout</button>
+            <button onclick="fitGraph()" class="btn btn-sm">Fit</button>
+            {% if center %}
+            <a href="/graph" class="btn btn-sm">Full Graph</a>
+            {% endif %}
+        </div>
+    </div>
+    <div id="cy" class="graph-canvas"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/graph.js"></script>
+<script>
+    initGraph({{ center|tojson if center else 'null' }});
+</script>
+{% endblock %}

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}LLM Wiki{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-left">
+            <a href="/" class="nav-brand">LLM Wiki</a>
+        </div>
+        <div class="nav-center">
+            <form action="/search" method="get" class="search-form">
+                <input type="text" name="q" placeholder="Search wiki..." value="{{ query|default('', true) }}" class="search-input">
+                <button type="submit" class="search-btn">Search</button>
+            </form>
+        </div>
+        <div class="nav-right">
+            <a href="/graph">Graph</a>
+            <a href="/search">Browse</a>
+            <button onclick="toggleTheme()" class="theme-toggle" title="Toggle theme">
+                <span id="theme-icon">&#9789;</span>
+            </button>
+        </div>
+    </nav>
+
+    <main class="content">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+        <p>LLM Wiki &mdash; Karpathy's LLM Wiki pattern on Databricks</p>
+    </footer>
+
+    <script src="/static/wiki.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

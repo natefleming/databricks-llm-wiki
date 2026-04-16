@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page.title if page else page_id }} - LLM Wiki{% endblock %}
+
+{% block content %}
+<div class="page-container">
+    {% if page %}
+    <div class="page-main">
+        <div class="page-header">
+            <h1>{{ page.title }}</h1>
+            <div class="page-meta">
+                <span class="badge badge-type">{{ page.page_type.value }}</span>
+                <span class="badge badge-{{ page.confidence.value }}">{{ page.confidence.value }}</span>
+                <span class="meta-item">Freshness: {{ page.freshness_tier.value }}</span>
+                {% if page.updated_at %}
+                <span class="meta-item">Updated: {{ page.updated_at.strftime('%Y-%m-%d') }}</span>
+                {% endif %}
+                <a href="/edit/{{ page.page_id }}" class="edit-link">Edit</a>
+            </div>
+            {% if page.tags %}
+            <div class="page-tags">
+                {% for tag in page.tags %}
+                <span class="tag">{{ tag }}</span>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+
+        <div class="page-content">
+            {{ content_html|safe }}
+        </div>
+    </div>
+
+    <aside class="page-sidebar">
+        {% if backlinks %}
+        <div class="sidebar-section">
+            <h3>Backlinks</h3>
+            <ul class="backlink-list">
+                {% for bl in backlinks %}
+                <li>
+                    <a href="/page/{{ bl.source_page_id }}" class="wikilink">
+                        {{ bl.source_page_id|replace('-', ' ')|title }}
+                    </a>
+                </li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        {% if page.related %}
+        <div class="sidebar-section">
+            <h3>Related</h3>
+            <ul class="related-list">
+                {% for rel in page.related %}
+                <li><a href="/page/{{ rel }}" class="wikilink">{{ rel|replace('-', ' ')|title }}</a></li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        <div class="sidebar-section">
+            <h3>Graph</h3>
+            <a href="/graph?center={{ page.page_id }}" class="graph-link">View neighborhood</a>
+        </div>
+    </aside>
+    {% else %}
+    <div class="page-not-found">
+        <h1>Page Not Found</h1>
+        <p>The page <code>{{ page_id }}</code> does not exist yet.</p>
+        <p>This could be a <span class="redlink">red link</span> waiting to be created.</p>
+        <a href="/" class="btn">Back to Home</a>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}LLM Wiki - Home{% endblock %}
+
+{% block content %}
+<div class="home-container">
+    <div class="home-hero">
+        <h1>LLM Wiki</h1>
+        <p class="subtitle">Knowledge compiles once, answers forever.</p>
+    </div>
+
+    {% if stats %}
+    <div class="stats-bar">
+        <div class="stat-item">
+            <span class="stat-value">{{ stats.get('total_pages', 0) }}</span>
+            <span class="stat-label">Pages</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-value">{{ stats.get('total_backlinks', 0) }}</span>
+            <span class="stat-label">Links</span>
+        </div>
+        {% for ptype, count in stats.get('by_type', {}).items() %}
+        <div class="stat-item">
+            <span class="stat-value">{{ count }}</span>
+            <span class="stat-label">{{ ptype|title }}</span>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if pages %}
+    <div class="page-list">
+        <h2>Recent Pages</h2>
+        <table class="wiki-table">
+            <thead>
+                <tr>
+                    <th>Page</th>
+                    <th>Type</th>
+                    <th>Confidence</th>
+                    <th>Updated</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for page in pages %}
+                <tr>
+                    <td><a href="/page/{{ page.page_id }}" class="wikilink">{{ page.title }}</a></td>
+                    <td><span class="badge badge-type">{{ page.page_type.value }}</span></td>
+                    <td><span class="badge badge-{{ page.confidence.value }}">{{ page.confidence.value }}</span></td>
+                    <td>{{ page.updated_at.strftime('%Y-%m-%d') if page.updated_at else '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <h2>Welcome to LLM Wiki</h2>
+        <p>No pages yet. Use the MCP tools or drop files into the incoming volume to get started.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

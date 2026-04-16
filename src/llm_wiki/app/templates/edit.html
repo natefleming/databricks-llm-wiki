@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}Edit: {{ page.title if page else page_id }} - LLM Wiki{% endblock %}
+
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="editor-container">
+    <div class="editor-header">
+        <h1>Edit: {{ page.title if page else page_id }}</h1>
+        <div class="editor-actions">
+            <a href="/page/{{ page_id }}" class="btn btn-sm">Cancel</a>
+            <button onclick="savePage()" class="btn btn-sm btn-primary">Save</button>
+        </div>
+    </div>
+
+    <div class="editor-split">
+        <div class="editor-pane">
+            <h3>Markdown</h3>
+            <textarea id="editor" class="editor-textarea" rows="30">{{ page.content_markdown if page else '' }}</textarea>
+        </div>
+        <div class="preview-pane">
+            <h3>Preview</h3>
+            <div id="preview" class="preview-content"></div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const editor = document.getElementById('editor');
+    const preview = document.getElementById('preview');
+    const pageId = '{{ page_id }}';
+
+    function updatePreview() {
+        preview.innerHTML = marked.parse(editor.value);
+    }
+
+    editor.addEventListener('input', updatePreview);
+    updatePreview();
+
+    async function savePage() {
+        const content = editor.value;
+        try {
+            const resp = await fetch(`/api/pages/${pageId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({content_markdown: content})
+            });
+            if (resp.ok) {
+                window.location.href = `/page/${pageId}`;
+            } else {
+                alert('Save failed: ' + resp.statusText);
+            }
+        } catch (e) {
+            alert('Save failed: ' + e.message);
+        }
+    }
+</script>
+{% endblock %}

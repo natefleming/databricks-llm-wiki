@@ -1,0 +1,59 @@
+wiki:
+  name: "LLM Wiki"
+  catalog: llm_wiki
+  default_model: databricks-claude-sonnet-4
+  embedding_model: databricks-gte-large-en
+  max_compilation_concurrency: 5
+
+page_types:
+  concept:
+    description: "Explains a concept, idea, or technique"
+    default_freshness: monthly
+  entity:
+    description: "Describes a person, organization, project, or named entity"
+    default_freshness: weekly
+  source:
+    description: "Summary and key takeaways from an ingested source document"
+    default_freshness: permanent
+  analysis:
+    description: "Cross-cutting analysis synthesizing multiple sources"
+    default_freshness: weekly
+  index:
+    description: "Auto-generated index listing related pages by category"
+    default_freshness: daily
+
+freshness_tiers:
+  live:
+    max_age_minutes: 15
+  hourly:
+    max_age_minutes: 60
+  daily:
+    max_age_minutes: 1440
+  weekly:
+    max_age_minutes: 10080
+  monthly:
+    max_age_minutes: 43200
+  permanent:
+    max_age_minutes: null
+
+confidence_levels:
+  high:
+    description: "Official docs, peer-reviewed papers, verified primary sources"
+    min_sources: 2
+  medium:
+    description: "Reputable blogs, conference talks, established secondary sources"
+    min_sources: 1
+  low:
+    description: "Single unverified source, community posts, opinion pieces"
+    min_sources: 0
+
+lakebase:
+  instance_name: llm-wiki-db
+  database_name: wiki
+
+vector_search:
+  endpoint_name: llm-wiki-vs-endpoint
+  index_name: llm_wiki.wiki.pages_vs_index
+
+obsidian:
+  volume_path: /Volumes/llm_wiki/wiki/obsidian

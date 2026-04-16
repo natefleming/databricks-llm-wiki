@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block title %}Search{% if query %}: {{ query }}{% endif %} - LLM Wiki{% endblock %}
+
+{% block content %}
+<div class="search-container">
+    <h1>Search Results</h1>
+
+    {% if query %}
+    <p class="search-summary">{{ results|length }} results for "{{ query }}"</p>
+    {% endif %}
+
+    {% if results %}
+    <div class="search-results">
+        {% for result in results %}
+        <div class="search-result">
+            <h3>
+                <a href="/page/{{ result.page_id }}" class="wikilink">
+                    {{ result.title or result.page_id|replace('-', ' ')|title }}
+                </a>
+            </h3>
+            <div class="result-meta">
+                {% if result.page_type %}
+                <span class="badge badge-type">{{ result.page_type }}</span>
+                {% endif %}
+                <span class="result-score">Score: {{ "%.3f"|format(result.score) }}</span>
+                <span class="result-source">{{ result.source }}</span>
+            </div>
+            {% if result.snippet %}
+            <p class="result-snippet">{{ result.snippet }}</p>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+    {% elif query %}
+    <div class="empty-state">
+        <p>No results found for "{{ query }}". Try a different search term.</p>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>Enter a search query to find wiki pages.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

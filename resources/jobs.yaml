@@ -1,0 +1,60 @@
+resources:
+  jobs:
+    # One-time setup job: creates Lakebase instance, tables,
+    # and Vector Search endpoint/index. Idempotent - safe to re-run.
+    llm_wiki_setup:
+      name: llm-wiki-setup-${bundle.target}
+      tasks:
+        - task_key: provision_infrastructure
+          notebook_task:
+            notebook_path: ../notebooks/setup_infrastructure.py
+            base_parameters:
+              catalog: ${var.catalog}
+              wiki_schema: ${var.wiki_schema}
+              raw_schema: ${var.raw_schema}
+              lakebase_instance: ${var.lakebase_instance}
+              embedding_endpoint: ${var.embedding_endpoint}
+
+    # Main compilation + sync pipeline (triggered after SDP or on-demand)
+    llm_wiki_compile:
+      name: llm-wiki-compile-${bundle.target}
+      tasks:
+        - task_key: compile_pages
+          notebook_task:
+            notebook_path: ../notebooks/compile_pages.py
+            base_parameters:
+              catalog: ${var.catalog}
+              wiki_schema: ${var.wiki_schema}
+              raw_schema: ${var.raw_schema}
+              llm_endpoint: ${var.llm_endpoint}
+
+        - task_key: sync_to_lakebase
+          depends_on:
+            - task_key: compile_pages
+          notebook_task:
+            notebook_path: ../notebooks/sync.py
+            base_parameters:
+              target: lakebase
+              catalog: ${var.catalog}
+              wiki_schema: ${var.wiki_schema}
+              lakebase_instance: ${var.lakebase_instance}
+
+        - task_key: sync_to_obsidian
+          depends_on:
+            - task_key: compile_pages
+          notebook_task:
+            notebook_path: ../notebooks/sync.py
+            base_parameters:
+              target: obsidian
+              catalog: ${var.catalog}
+              wiki_schema: ${var.wiki_schema}
+
+        - task_key: trigger_vector_search_sync
+          depends_on:
+            - task_key: compile_pages
+          notebook_task:
+            notebook_path: ../notebooks/sync.py
+            base_parameters:
+              target: vector_search
+              catalog: ${var.catalog}
+              wiki_schema: ${var.wiki_schema}

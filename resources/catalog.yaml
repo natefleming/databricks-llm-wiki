@@ -1,0 +1,26 @@
+resources:
+  schemas:
+    raw_sources_schema:
+      catalog_name: ${var.catalog}
+      name: ${var.raw_schema}
+      comment: "LLM Wiki - raw source documents"
+
+    wiki_schema:
+      catalog_name: ${var.catalog}
+      name: ${var.wiki_schema}
+      comment: "LLM Wiki - compiled wiki pages and indexes"
+
+  volumes:
+    incoming_volume:
+      catalog_name: ${var.catalog}
+      schema_name: ${var.raw_schema}
+      name: incoming
+      volume_type: MANAGED
+      comment: "Drop zone for new source files"
+
+    obsidian_volume:
+      catalog_name: ${var.catalog}
+      schema_name: ${var.wiki_schema}
+      name: obsidian
+      volume_type: MANAGED
+      comment: "Markdown files for Obsidian sync"

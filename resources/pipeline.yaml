@@ -1,0 +1,19 @@
+resources:
+  pipelines:
+    llm_wiki_etl:
+      name: llm-wiki-etl-${bundle.target}
+      catalog: ${var.catalog}
+      target: ${var.raw_schema}
+      serverless: true
+      development: ${var.is_development}
+      libraries:
+        - notebook:
+            path: ../src/llm_wiki/pipeline/bronze.py
+        - notebook:
+            path: ../src/llm_wiki/pipeline/silver.py
+        - notebook:
+            path: ../src/llm_wiki/pipeline/gold.py
+      configuration:
+        wiki.catalog: ${var.catalog}
+        wiki.raw_schema: ${var.raw_schema}
+        wiki.wiki_schema: ${var.wiki_schema}
