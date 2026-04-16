@@ -93,9 +93,15 @@ class QueryEngine:
         messages = get_query_prompt(question, context_text)
 
         try:
+            from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+            sdk_messages = [
+                ChatMessage(role=ChatMessageRole(m["role"]), content=m["content"])
+                for m in messages
+            ]
+
             response = self._client.serving_endpoints.query(
                 name=self._config.wiki.default_model,
-                messages=messages,
+                messages=sdk_messages,
                 max_tokens=2048,
                 temperature=0.2,
             )
@@ -103,8 +109,10 @@ class QueryEngine:
             answer = ""
             if hasattr(response, "choices") and response.choices:
                 choice = response.choices[0]
-                if hasattr(choice, "message") and choice.message:
+                if hasattr(choice, "message") and hasattr(choice.message, "content"):
                     answer = choice.message.content or ""
+                elif isinstance(choice, dict):
+                    answer = choice.get("message", {}).get("content", "")
 
         except Exception as e:
             logger.error("Query LLM call failed", error=str(e))

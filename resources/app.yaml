@@ -4,17 +4,6 @@ resources:
       name: llm-wiki-${bundle.target}
       description: "LLM Wiki - MCP server, web UI, and API"
       source_code_path: ${workspace.file_path}
-      config:
-        command: [python, -m, llm_wiki.app.server]
-        env:
-          - name: WIKI_CATALOG
-            value: ${var.catalog}
-          - name: WIKI_SCHEMA
-            value: ${var.wiki_schema}
-          - name: LAKEBASE_INSTANCE
-            value: ${var.lakebase_instance}
-          - name: LLM_ENDPOINT
-            value: ${var.llm_endpoint}
       resources:
         - name: llm_endpoint
           serving_endpoint:

@@ -1,12 +1,12 @@
 """Delta table storage operations for LLM Wiki.
 
-Provides CRUD operations on wiki Delta tables via databricks-sql-connector.
-This is the source-of-truth layer - all data originates here.
+Provides CRUD operations on wiki Delta tables using the Databricks SDK
+Statement Execution API. This avoids the need for a SQL warehouse HTTP path.
 
 Usage:
     from llm_wiki.storage.delta import DeltaStore
 
-    store = DeltaStore(catalog="llm_wiki", schema="wiki")
+    store = DeltaStore(catalog="nfleming", wiki_schema="wiki_nate_fleming")
     page = store.get_page("kubernetes-scheduling")
 """
 
@@ -19,35 +19,32 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from databricks import sql as dbsql
+from databricks.sdk import WorkspaceClient
 
 from llm_wiki.log import logger
 from llm_wiki.models import (
-    ActivityLogEntry,
     BackLink,
     CompilationQueueItem,
     CompilationStatus,
     Page,
-    Source,
-    SourceChunk,
+    SearchResult,
 )
 
 
 class DeltaStore:
-    """Delta table storage backend for LLM Wiki.
+    """Delta table storage backend using Databricks SDK Statement Execution API.
 
-    Manages pages, sources, backlinks, compilation queue, and activity log
-    in Unity Catalog Delta tables.
+    Uses the SDK's SQL statement execution which auto-discovers a warehouse,
+    avoiding manual warehouse configuration.
     """
 
     def __init__(
         self,
-        catalog: str = "llm_wiki",
+        catalog: str = "nfleming",
         wiki_schema: str = "wiki",
         raw_schema: str = "raw_sources",
-        server_hostname: str | None = None,
-        http_path: str | None = None,
-        access_token: str | None = None,
+        warehouse_id: str | None = None,
+        client: WorkspaceClient | None = None,
     ) -> None:
         """Initialize the Delta store.
 
@@ -55,25 +52,46 @@ class DeltaStore:
             catalog: Unity Catalog catalog name.
             wiki_schema: Schema for wiki tables (pages, backlinks, etc.).
             raw_schema: Schema for raw source tables.
-            server_hostname: Databricks workspace hostname. Defaults to env var.
-            http_path: SQL warehouse HTTP path. Defaults to env var.
-            access_token: Databricks access token. Defaults to env var.
+            warehouse_id: Optional SQL warehouse ID. Auto-detected if not set.
+            client: Optional pre-configured WorkspaceClient.
         """
         self.catalog = catalog
         self.wiki_schema = wiki_schema
         self.raw_schema = raw_schema
-        self._server_hostname = server_hostname or os.environ.get("DATABRICKS_SERVER_HOSTNAME", "")
-        self._http_path = http_path or os.environ.get("DATABRICKS_HTTP_PATH", "")
-        self._access_token = access_token or os.environ.get("DATABRICKS_TOKEN", "")
-
-    def _connect(self) -> dbsql.client.Connection:
-        """Create a new database connection."""
-        return dbsql.connect(
-            server_hostname=self._server_hostname,
-            http_path=self._http_path,
-            access_token=self._access_token,
-            catalog=self.catalog,
+        self._warehouse_id = warehouse_id or os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
+        self._client = client or WorkspaceClient()
+        logger.info(
+            "DeltaStore initialized",
+            catalog=catalog,
+            wiki_schema=wiki_schema,
+            warehouse_id=self._warehouse_id or "(auto)",
         )
+
+    def _execute(self, sql: str) -> list[list[Any]]:
+        """Execute a SQL statement and return rows.
+
+        Uses the Statement Execution API which auto-discovers a warehouse
+        when warehouse_id is not set.
+
+        Args:
+            sql: SQL statement to execute.
+
+        Returns:
+            List of rows, each row is a list of column values.
+        """
+        try:
+            kwargs: dict[str, Any] = {"statement": sql, "catalog": self.catalog}
+            if self._warehouse_id:
+                kwargs["warehouse_id"] = self._warehouse_id
+
+            response = self._client.statement_execution.execute_statement(**kwargs)
+
+            if response.result and response.result.data_array:
+                return response.result.data_array
+            return []
+        except Exception as e:
+            logger.error("SQL execution failed", sql=sql[:200], error=str(e))
+            raise
 
     def _wiki_table(self, table: str) -> str:
         """Return fully qualified wiki table name."""
@@ -96,20 +114,16 @@ class DeltaStore:
         Returns:
             Page instance or None if not found.
         """
-        query = f"""
-            SELECT page_id, title, page_type, content_markdown, frontmatter,
+        rows = self._execute(f"""
+            SELECT page_id, title, page_type, content_markdown,
                    confidence, sources, related, tags, freshness_tier,
                    content_hash, created_at, updated_at, compiled_by
             FROM {self._wiki_table("pages")}
-            WHERE page_id = %s
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, [page_id])
-                row = cursor.fetchone()
-                if row is None:
-                    return None
-                return self._row_to_page(row, cursor.description)
+            WHERE page_id = '{_esc(page_id)}'
+        """)
+        if not rows:
+            return None
+        return self._row_to_page(rows[0])
 
     def list_pages(
         self,
@@ -128,31 +142,44 @@ class DeltaStore:
             List of Page instances.
         """
         conditions: list[str] = []
-        params: list[Any] = []
-
         if page_type:
-            conditions.append("page_type = %s")
-            params.append(page_type)
+            conditions.append(f"page_type = '{_esc(page_type)}'")
         if tag:
-            conditions.append("array_contains(tags, %s)")
-            params.append(tag)
+            conditions.append(f"array_contains(tags, '{_esc(tag)}')")
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"""
-            SELECT page_id, title, page_type, content_markdown, frontmatter,
+        rows = self._execute(f"""
+            SELECT page_id, title, page_type, content_markdown,
                    confidence, sources, related, tags, freshness_tier,
                    content_hash, created_at, updated_at, compiled_by
             FROM {self._wiki_table("pages")}
             {where}
             ORDER BY updated_at DESC
-            LIMIT %s
-        """
-        params.append(limit)
+            LIMIT {limit}
+        """)
+        return [self._row_to_page(row) for row in rows]
 
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                return [self._row_to_page(row, cursor.description) for row in cursor.fetchall()]
+    def search_pages(self, query_text: str, limit: int = 20) -> list[Page]:
+        """Search pages by title and content using SQL LIKE.
+
+        Args:
+            query_text: Search query string.
+            limit: Maximum results.
+
+        Returns:
+            List of matching Pages.
+        """
+        pattern = f"%{_esc(query_text)}%"
+        rows = self._execute(f"""
+            SELECT page_id, title, page_type, content_markdown,
+                   confidence, sources, related, tags, freshness_tier,
+                   content_hash, created_at, updated_at, compiled_by
+            FROM {self._wiki_table("pages")}
+            WHERE title LIKE '{pattern}' OR content_markdown LIKE '{pattern}'
+            ORDER BY updated_at DESC
+            LIMIT {limit}
+        """)
+        return [self._row_to_page(row) for row in rows]
 
     def upsert_page(self, page: Page) -> None:
         """Insert or update a page in the pages table.
@@ -164,28 +191,13 @@ class DeltaStore:
         content_hash = hashlib.sha256(page.content_markdown.encode()).hexdigest()[:16]
         frontmatter_json = page.frontmatter.model_dump_json() if page.frontmatter else "{}"
 
-        query = f"""
-            MERGE INTO {self._wiki_table("pages")} AS target
-            USING (SELECT %s AS page_id) AS source
-            ON target.page_id = source.page_id
-            WHEN MATCHED THEN UPDATE SET
-                title = %s, page_type = %s, content_markdown = %s, frontmatter = %s,
-                confidence = %s, sources = %s, related = %s, tags = %s,
-                freshness_tier = %s, content_hash = %s, updated_at = %s, compiled_by = %s
-            WHEN NOT MATCHED THEN INSERT (
-                page_id, title, page_type, content_markdown, frontmatter,
-                confidence, sources, related, tags, freshness_tier,
-                content_hash, created_at, updated_at, compiled_by
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
         sources_arr = f"ARRAY({','.join(repr(s) for s in page.sources)})" if page.sources else "ARRAY()"
         related_arr = f"ARRAY({','.join(repr(r) for r in page.related)})" if page.related else "ARRAY()"
         tags_arr = f"ARRAY({','.join(repr(t) for t in page.tags)})" if page.tags else "ARRAY()"
 
-        # Use SQL directly for array types since connector doesn't support array params well
-        insert_sql = f"""
+        self._execute(f"""
             MERGE INTO {self._wiki_table("pages")} AS target
-            USING (SELECT '{page.page_id}' AS page_id) AS source
+            USING (SELECT '{_esc(page.page_id)}' AS page_id) AS source
             ON target.page_id = source.page_id
             WHEN MATCHED THEN UPDATE SET
                 title = '{_esc(page.title)}',
@@ -205,42 +217,14 @@ class DeltaStore:
                 confidence, sources, related, tags, freshness_tier,
                 content_hash, created_at, updated_at, compiled_by
             ) VALUES (
-                '{page.page_id}', '{_esc(page.title)}', '{page.page_type.value}',
+                '{_esc(page.page_id)}', '{_esc(page.title)}', '{page.page_type.value}',
                 '{_esc(page.content_markdown)}', '{_esc(frontmatter_json)}',
                 '{page.confidence.value}', {sources_arr}, {related_arr}, {tags_arr},
                 '{page.freshness_tier.value}', '{content_hash}',
                 '{now.isoformat()}', '{now.isoformat()}', '{_esc(page.compiled_by)}'
             )
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(insert_sql)
+        """)
         logger.info("Upserted page", page_id=page.page_id)
-
-    def search_pages(self, query_text: str, limit: int = 20) -> list[Page]:
-        """Search pages by title and content using SQL LIKE.
-
-        Args:
-            query_text: Search query string.
-            limit: Maximum results.
-
-        Returns:
-            List of matching Pages.
-        """
-        pattern = f"%{_esc(query_text)}%"
-        query = f"""
-            SELECT page_id, title, page_type, content_markdown, frontmatter,
-                   confidence, sources, related, tags, freshness_tier,
-                   content_hash, created_at, updated_at, compiled_by
-            FROM {self._wiki_table("pages")}
-            WHERE title LIKE '{pattern}' OR content_markdown LIKE '{pattern}'
-            ORDER BY updated_at DESC
-            LIMIT {limit}
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
-                return [self._row_to_page(row, cursor.description) for row in cursor.fetchall()]
 
     # ──────────────────────────────────────────────
     # Backlink operations
@@ -255,23 +239,20 @@ class DeltaStore:
         Returns:
             List of BackLink instances.
         """
-        query = f"""
+        rows = self._execute(f"""
             SELECT source_page_id, target_page_id, link_text, context_snippet
             FROM {self._wiki_table("backlinks")}
-            WHERE target_page_id = %s
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, [page_id])
-                return [
-                    BackLink(
-                        source_page_id=row[0],
-                        target_page_id=row[1],
-                        link_text=row[2] or "",
-                        context_snippet=row[3] or "",
-                    )
-                    for row in cursor.fetchall()
-                ]
+            WHERE target_page_id = '{_esc(page_id)}'
+        """)
+        return [
+            BackLink(
+                source_page_id=row[0] or "",
+                target_page_id=row[1] or "",
+                link_text=row[2] or "",
+                context_snippet=row[3] or "",
+            )
+            for row in rows
+        ]
 
     def upsert_backlinks(self, links: list[BackLink]) -> None:
         """Insert or update backlinks.
@@ -287,7 +268,7 @@ class DeltaStore:
             f"'{_esc(l.link_text)}', '{_esc(l.context_snippet)}')"
             for l in links
         )
-        query = f"""
+        self._execute(f"""
             MERGE INTO {self._wiki_table("backlinks")} AS target
             USING (
                 SELECT * FROM VALUES {values}
@@ -299,10 +280,7 @@ class DeltaStore:
                 link_text = source.link_text,
                 context_snippet = source.context_snippet
             WHEN NOT MATCHED THEN INSERT *
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
+        """)
         logger.info("Upserted backlinks", count=len(links))
 
     # ──────────────────────────────────────────────
@@ -318,31 +296,28 @@ class DeltaStore:
         Returns:
             List of pending CompilationQueueItem instances.
         """
-        query = f"""
+        rows = self._execute(f"""
             SELECT queue_id, page_id, trigger_type, trigger_source_ids,
                    priority, status, created_at, completed_at, error_message
             FROM {self._wiki_table("compilation_queue")}
             WHERE status = 'pending'
             ORDER BY priority DESC, created_at ASC
             LIMIT {limit}
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
-                return [
-                    CompilationQueueItem(
-                        queue_id=row[0],
-                        page_id=row[1],
-                        trigger_type=row[2],
-                        trigger_source_ids=row[3] or [],
-                        priority=row[4] or 0,
-                        status=row[5],
-                        created_at=row[6],
-                        completed_at=row[7],
-                        error_message=row[8] or "",
-                    )
-                    for row in cursor.fetchall()
-                ]
+        """)
+        return [
+            CompilationQueueItem(
+                queue_id=row[0] or "",
+                page_id=row[1] or "",
+                trigger_type=row[2] or "manual",
+                trigger_source_ids=row[3] or [],
+                priority=row[4] or 0,
+                status=row[5] or "pending",
+                created_at=row[6],
+                completed_at=row[7],
+                error_message=row[8] or "",
+            )
+            for row in rows
+        ]
 
     def update_compilation_status(
         self,
@@ -350,25 +325,16 @@ class DeltaStore:
         status: CompilationStatus,
         error_message: str = "",
     ) -> None:
-        """Update the status of a compilation queue item.
-
-        Args:
-            queue_id: The queue item ID.
-            status: New status.
-            error_message: Error message if status is FAILED.
-        """
+        """Update the status of a compilation queue item."""
         now = datetime.now(timezone.utc).isoformat()
         completed = f"'{now}'" if status in (CompilationStatus.COMPLETED, CompilationStatus.FAILED) else "NULL"
-        query = f"""
+        self._execute(f"""
             UPDATE {self._wiki_table("compilation_queue")}
             SET status = '{status.value}',
                 completed_at = {completed},
                 error_message = '{_esc(error_message)}'
             WHERE queue_id = '{_esc(queue_id)}'
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
+        """)
 
     def enqueue_compilation(
         self,
@@ -377,165 +343,120 @@ class DeltaStore:
         trigger_source_ids: list[str] | None = None,
         priority: int = 0,
     ) -> str:
-        """Add a new item to the compilation queue.
-
-        Args:
-            page_id: Target page to compile.
-            trigger_type: What triggered this compilation.
-            trigger_source_ids: Source IDs that triggered this.
-            priority: Priority (higher = more urgent).
-
-        Returns:
-            The queue_id of the new item.
-        """
+        """Add a new item to the compilation queue."""
         queue_id = str(uuid4())
         source_ids = trigger_source_ids or []
         sources_arr = f"ARRAY({','.join(repr(s) for s in source_ids)})" if source_ids else "ARRAY()"
         now = datetime.now(timezone.utc).isoformat()
 
-        query = f"""
+        self._execute(f"""
             INSERT INTO {self._wiki_table("compilation_queue")}
             (queue_id, page_id, trigger_type, trigger_source_ids, priority, status, created_at)
             VALUES ('{queue_id}', '{_esc(page_id)}', '{_esc(trigger_type)}',
                     {sources_arr}, {priority}, 'pending', '{now}')
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
+        """)
         logger.info("Enqueued compilation", queue_id=queue_id, page_id=page_id)
         return queue_id
-
-    # ──────────────────────────────────────────────
-    # Source operations
-    # ──────────────────────────────────────────────
-
-    def get_source_chunks(self, source_id: str) -> list[SourceChunk]:
-        """Get all chunks for a source document.
-
-        Args:
-            source_id: The source identifier.
-
-        Returns:
-            List of SourceChunk instances ordered by chunk_index.
-        """
-        query = f"""
-            SELECT chunk_id, source_id, chunk_index, chunk_text, token_count
-            FROM {self._raw_table("source_chunks")}
-            WHERE source_id = %s
-            ORDER BY chunk_index
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, [source_id])
-                return [
-                    SourceChunk(
-                        chunk_id=row[0],
-                        source_id=row[1],
-                        chunk_index=row[2],
-                        chunk_text=row[3],
-                        token_count=row[4] or 0,
-                    )
-                    for row in cursor.fetchall()
-                ]
 
     # ──────────────────────────────────────────────
     # Activity log
     # ──────────────────────────────────────────────
 
     def log_activity(self, operation: str, details: str, page_ids: list[str] | None = None) -> None:
-        """Write an entry to the activity log.
-
-        Args:
-            operation: Operation name (ingest, compile, query, lint).
-            details: Human-readable description.
-            page_ids: List of affected page IDs.
-        """
+        """Write an entry to the activity log."""
         log_id = str(uuid4())
         ids = page_ids or []
         ids_arr = f"ARRAY({','.join(repr(p) for p in ids)})" if ids else "ARRAY()"
         now = datetime.now(timezone.utc).isoformat()
 
-        query = f"""
+        self._execute(f"""
             INSERT INTO {self._wiki_table("activity_log")}
             (log_id, operation, details, page_ids, timestamp)
             VALUES ('{log_id}', '{_esc(operation)}', '{_esc(details)}', {ids_arr}, '{now}')
-        """
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
+        """)
 
     # ──────────────────────────────────────────────
     # Statistics
     # ──────────────────────────────────────────────
 
     def get_stats(self) -> dict[str, Any]:
-        """Get wiki statistics: page counts, type distribution, freshness.
-
-        Returns:
-            Dictionary with statistics.
-        """
-        queries = {
-            "total_pages": f"SELECT COUNT(*) FROM {self._wiki_table('pages')}",
-            "by_type": f"""
-                SELECT page_type, COUNT(*) as cnt
-                FROM {self._wiki_table("pages")}
-                GROUP BY page_type
-            """,
-            "by_confidence": f"""
-                SELECT confidence, COUNT(*) as cnt
-                FROM {self._wiki_table("pages")}
-                GROUP BY confidence
-            """,
-            "total_backlinks": f"SELECT COUNT(*) FROM {self._wiki_table('backlinks')}",
-            "pending_compilations": f"""
-                SELECT COUNT(*) FROM {self._wiki_table("compilation_queue")}
-                WHERE status = 'pending'
-            """,
-        }
-
+        """Get wiki statistics: page counts, type distribution, freshness."""
         stats: dict[str, Any] = {}
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(queries["total_pages"])
-                stats["total_pages"] = cursor.fetchone()[0]
 
-                cursor.execute(queries["by_type"])
-                stats["by_type"] = {row[0]: row[1] for row in cursor.fetchall()}
+        rows = self._execute(f"SELECT COUNT(*) FROM {self._wiki_table('pages')}")
+        stats["total_pages"] = rows[0][0] if rows else 0
 
-                cursor.execute(queries["by_confidence"])
-                stats["by_confidence"] = {row[0]: row[1] for row in cursor.fetchall()}
+        rows = self._execute(f"""
+            SELECT page_type, COUNT(*) as cnt
+            FROM {self._wiki_table("pages")}
+            GROUP BY page_type
+        """)
+        stats["by_type"] = {row[0]: row[1] for row in rows}
 
-                cursor.execute(queries["total_backlinks"])
-                stats["total_backlinks"] = cursor.fetchone()[0]
+        rows = self._execute(f"""
+            SELECT confidence, COUNT(*) as cnt
+            FROM {self._wiki_table("pages")}
+            GROUP BY confidence
+        """)
+        stats["by_confidence"] = {row[0]: row[1] for row in rows}
 
-                cursor.execute(queries["pending_compilations"])
-                stats["pending_compilations"] = cursor.fetchone()[0]
+        rows = self._execute(f"SELECT COUNT(*) FROM {self._wiki_table('backlinks')}")
+        stats["total_backlinks"] = rows[0][0] if rows else 0
+
+        rows = self._execute(f"""
+            SELECT COUNT(*) FROM {self._wiki_table("compilation_queue")}
+            WHERE status = 'pending'
+        """)
+        stats["pending_compilations"] = rows[0][0] if rows else 0
 
         return stats
+
+    # ──────────────────────────────────────────────
+    # Source operations
+    # ──────────────────────────────────────────────
+
+    def get_source_chunks(self, source_id: str) -> list:
+        """Get all chunks for a source document."""
+        from llm_wiki.models import SourceChunk
+
+        rows = self._execute(f"""
+            SELECT chunk_id, source_id, chunk_index, chunk_text, token_count
+            FROM {self._raw_table("source_chunks")}
+            WHERE source_id = '{_esc(source_id)}'
+            ORDER BY chunk_index
+        """)
+        return [
+            SourceChunk(
+                chunk_id=row[0] or "",
+                source_id=row[1] or "",
+                chunk_index=row[2] or 0,
+                chunk_text=row[3] or "",
+                token_count=row[4] or 0,
+            )
+            for row in rows
+        ]
 
     # ──────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────
 
     @staticmethod
-    def _row_to_page(row: tuple, description: list) -> Page:
-        """Convert a database row to a Page model."""
-        cols = [d[0] for d in description]
-        data = dict(zip(cols, row))
+    def _row_to_page(row: list) -> Page:
+        """Convert a result row to a Page model."""
         return Page(
-            page_id=data.get("page_id", ""),
-            title=data.get("title", ""),
-            page_type=data.get("page_type", "concept"),
-            content_markdown=data.get("content_markdown", ""),
-            confidence=data.get("confidence", "low"),
-            sources=data.get("sources") or [],
-            related=data.get("related") or [],
-            tags=data.get("tags") or [],
-            freshness_tier=data.get("freshness_tier", "monthly"),
-            content_hash=data.get("content_hash", ""),
-            created_at=data.get("created_at"),
-            updated_at=data.get("updated_at"),
-            compiled_by=data.get("compiled_by", ""),
+            page_id=row[0] or "",
+            title=row[1] or "",
+            page_type=row[2] or "concept",
+            content_markdown=row[3] or "",
+            confidence=row[4] or "low",
+            sources=row[5] or [],
+            related=row[6] or [],
+            tags=row[7] or [],
+            freshness_tier=row[8] or "monthly",
+            content_hash=row[9] or "",
+            created_at=row[10],
+            updated_at=row[11],
+            compiled_by=row[12] or "",
         )
 
 

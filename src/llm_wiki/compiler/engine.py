@@ -277,11 +277,19 @@ class WikiCompiler:
         endpoint = self.config.wiki.default_model
         last_error = None
 
+        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
         for attempt in range(max_retries):
             try:
+                # Convert dicts to SDK ChatMessage objects
+                sdk_messages = [
+                    ChatMessage(role=ChatMessageRole(m["role"]), content=m["content"])
+                    for m in messages
+                ]
+
                 response = self._client.serving_endpoints.query(
                     name=endpoint,
-                    messages=messages,
+                    messages=sdk_messages,
                     max_tokens=4096,
                     temperature=0.3,
                 )
@@ -291,8 +299,10 @@ class WikiCompiler:
 
                 if hasattr(response, "choices") and response.choices:
                     choice = response.choices[0]
-                    if hasattr(choice, "message") and choice.message:
+                    if hasattr(choice, "message") and hasattr(choice.message, "content"):
                         content = choice.message.content or ""
+                    elif isinstance(choice, dict):
+                        content = choice.get("message", {}).get("content", "")
                     tokens_used = getattr(response, "usage", None)
                     if tokens_used and hasattr(tokens_used, "total_tokens"):
                         tokens_used = tokens_used.total_tokens

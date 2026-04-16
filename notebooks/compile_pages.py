@@ -96,26 +96,30 @@ Source material:
 Write a comprehensive wiki page with cross-references using [[slug]] wikilinks."""}
     ]
 
-    # Call FMAPI via REST API (avoids SDK serialization issues)
-    import requests
-    workspace_url = spark.conf.get("spark.databricks.workspaceUrl", "")
-    token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+    # Call FMAPI via Databricks SDK WorkspaceClient
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
-    api_url = f"https://{workspace_url}/serving-endpoints/{llm_endpoint}/invocations"
-    payload = {
-        "messages": messages,
-        "max_tokens": 4096,
-        "temperature": 0.3,
-    }
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    resp = requests.post(api_url, json=payload, headers=headers, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
+    w = WorkspaceClient()
+    sdk_messages = [
+        ChatMessage(role=ChatMessageRole(m["role"]), content=m["content"])
+        for m in messages
+    ]
+
+    response = w.serving_endpoints.query(
+        name=llm_endpoint,
+        messages=sdk_messages,
+        max_tokens=4096,
+        temperature=0.3,
+    )
 
     content = ""
-    choices = data.get("choices", [])
-    if choices:
-        content = choices[0].get("message", {}).get("content", "")
+    if hasattr(response, "choices") and response.choices:
+        choice = response.choices[0]
+        if hasattr(choice, "message") and hasattr(choice.message, "content"):
+            content = choice.message.content or ""
+        elif isinstance(choice, dict):
+            content = choice.get("message", {}).get("content", "")
 
     return title, content
 
