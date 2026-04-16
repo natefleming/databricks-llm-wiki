@@ -21,6 +21,11 @@ templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 router = APIRouter()
 
 
+def _get_store(request: Request):
+    """Get the best available store (Lakebase or Delta fallback)."""
+    return request.app.state.lakebase_store or request.app.state.delta_store
+
+
 def _render_markdown(content: str) -> str:
     """Render markdown to HTML, converting [[wikilinks]] to <a> tags.
 
@@ -56,7 +61,7 @@ def _render_markdown(content: str) -> str:
 @router.get("/", response_class=HTMLResponse)
 async def home(request: Request) -> HTMLResponse:
     """Homepage: recent pages, search bar, stats."""
-    store = request.app.state.lakebase_store
+    store = _get_store(request)
     context: dict = {"request": request, "pages": [], "stats": {}}
 
     if store:
@@ -72,11 +77,8 @@ async def home(request: Request) -> HTMLResponse:
 @router.get("/page/{page_id}", response_class=HTMLResponse)
 async def page_view(page_id: str, request: Request) -> HTMLResponse:
     """View a wiki page with rendered markdown and backlinks."""
-    store = request.app.state.lakebase_store
-    if not store:
-        return HTMLResponse("<h1>Store not available</h1>", status_code=503)
-
-    page = store.get_page(page_id)
+    store = _get_store(request)
+    page = store.get_page(page_id) if store else None
     if not page:
         return templates.TemplateResponse("page.html", {
             "request": request,
@@ -87,7 +89,10 @@ async def page_view(page_id: str, request: Request) -> HTMLResponse:
         })
 
     content_html = _render_markdown(page.content_markdown)
-    backlinks = store.get_backlinks(page_id)
+    try:
+        backlinks = store.get_backlinks(page_id)
+    except Exception:
+        backlinks = []
 
     return templates.TemplateResponse("page.html", {
         "request": request,
@@ -129,7 +134,7 @@ async def graph_view(request: Request, center: str | None = None) -> HTMLRespons
 @router.get("/edit/{page_id}", response_class=HTMLResponse)
 async def edit_page(page_id: str, request: Request) -> HTMLResponse:
     """Page editor with live markdown preview."""
-    store = request.app.state.lakebase_store
+    store = _get_store(request)
     page = store.get_page(page_id) if store else None
 
     return templates.TemplateResponse("edit.html", {
@@ -142,7 +147,7 @@ async def edit_page(page_id: str, request: Request) -> HTMLResponse:
 @router.get("/stats", response_class=HTMLResponse)
 async def stats_page(request: Request) -> HTMLResponse:
     """Wiki statistics dashboard."""
-    store = request.app.state.lakebase_store
+    store = _get_store(request)
     stats = store.get_stats() if store else {}
 
     return templates.TemplateResponse("home.html", {

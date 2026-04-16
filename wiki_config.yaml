@@ -1,7 +1,7 @@
 wiki:
   name: "LLM Wiki"
-  catalog: llm_wiki
-  default_model: databricks-claude-sonnet-4
+  catalog: nfleming
+  default_model: databricks-claude-sonnet-4-5
   embedding_model: databricks-gte-large-en
   max_compilation_concurrency: 5
 

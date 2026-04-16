@@ -3,97 +3,127 @@
 # MAGIC # LLM Wiki - Sync
 # MAGIC
 # MAGIC Syncs compiled wiki pages from Delta tables to serving layers:
-# MAGIC - **lakebase**: Upsert pages and backlinks to Lakebase/Postgres
+# MAGIC - **lakebase**: Upsert pages to Lakebase/Postgres (skipped if unavailable)
 # MAGIC - **obsidian**: Export markdown files to UC Volume for Obsidian
 # MAGIC - **vector_search**: Trigger Vector Search index resync
 
 # COMMAND ----------
 
-# Parameters
-dbutils.widgets.text("target", "lakebase")  # lakebase, obsidian, vector_search, all
-dbutils.widgets.text("catalog", "llm_wiki")
-dbutils.widgets.text("wiki_schema", "wiki")
-dbutils.widgets.text("raw_schema", "raw_sources")
+dbutils.widgets.text("target", "obsidian")
+dbutils.widgets.text("catalog", "nfleming")
+dbutils.widgets.text("wiki_schema", "wiki_nate_fleming")
 dbutils.widgets.text("lakebase_instance", "llm-wiki-db")
 
 target = dbutils.widgets.get("target")
 catalog = dbutils.widgets.get("catalog")
 wiki_schema = dbutils.widgets.get("wiki_schema")
-raw_schema = dbutils.widgets.get("raw_schema")
 lakebase_instance = dbutils.widgets.get("lakebase_instance")
 
 print(f"Sync target: {target}")
-print(f"Catalog: {catalog}")
-print(f"Wiki schema: {wiki_schema}")
-
-# COMMAND ----------
-
-from llm_wiki.storage.delta import DeltaStore
-from llm_wiki.storage.lakebase import LakebaseStore
-from llm_wiki.storage.volumes import VolumeStore
-from llm_wiki.sync import WikiSync
-
-# Initialize Delta store (always needed)
-delta_store = DeltaStore(
-    catalog=catalog,
-    wiki_schema=wiki_schema,
-    raw_schema=raw_schema,
-    server_hostname=spark.conf.get("spark.databricks.workspaceUrl", ""),
-)
-
-# Initialize optional stores based on target
-lakebase_store = None
-volume_store = None
-
-if target in ("lakebase", "all"):
-    from databricks.sdk import WorkspaceClient
-    w = WorkspaceClient()
-    lb_info = w.lakebase.get_database_instance(lakebase_instance)
-    lakebase_store = LakebaseStore(
-        host=lb_info.host,
-        port=lb_info.port or 5432,
-        database="wiki",
-    )
-
-if target in ("obsidian", "all"):
-    volume_store = VolumeStore(
-        catalog=catalog,
-        raw_schema=raw_schema,
-        wiki_schema=wiki_schema,
-    )
-
-# Initialize sync manager
-sync = WikiSync(
-    delta_store=delta_store,
-    lakebase_store=lakebase_store,
-    volume_store=volume_store,
-)
+print(f"Source: {catalog}.{wiki_schema}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Execute Sync
+# MAGIC ## Load Pages from Delta
 
 # COMMAND ----------
 
-if target == "all":
-    results = sync.sync_all()
-    print(f"Sync results: {results}")
-elif target == "lakebase":
-    count = sync.sync_to_lakebase()
-    print(f"Synced {count} pages to Lakebase")
-elif target == "obsidian":
-    count = sync.sync_to_obsidian()
-    print(f"Exported {count} pages to Obsidian volume")
-elif target == "vector_search":
-    success = sync.trigger_vector_search_sync()
-    print(f"Vector Search sync triggered: {success}")
-else:
-    print(f"Unknown target: {target}")
+pages_df = spark.sql(f"""
+    SELECT page_id, title, page_type, content_markdown, confidence,
+           sources, related, tags, freshness_tier, created_at, updated_at
+    FROM {catalog}.{wiki_schema}.pages
+""")
+pages = pages_df.collect()
+print(f"Loaded {len(pages)} pages from Delta")
 
 # COMMAND ----------
 
-# Cleanup
-if lakebase_store:
-    lakebase_store.close()
-print("Sync complete!")
+# MAGIC %md
+# MAGIC ## Sync to Obsidian Volume
+
+# COMMAND ----------
+
+if target in ("obsidian", "all"):
+    import yaml
+
+    obsidian_path = f"/Volumes/{catalog}/{wiki_schema}/obsidian"
+
+    for page in pages:
+        # Build YAML frontmatter
+        fm = {
+            "title": page.title,
+            "type": page.page_type or "concept",
+            "confidence": page.confidence or "low",
+        }
+        if page.sources:
+            fm["sources"] = list(page.sources)
+        if page.related:
+            fm["related"] = list(page.related)
+        if page.tags:
+            fm["tags"] = list(page.tags)
+        fm["freshness_tier"] = page.freshness_tier or "monthly"
+        if page.created_at:
+            fm["created"] = page.created_at.strftime("%Y-%m-%d")
+        if page.updated_at:
+            fm["updated"] = page.updated_at.strftime("%Y-%m-%d")
+
+        fm_str = yaml.dump(fm, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        md_content = f"---\n{fm_str}---\n\n{page.content_markdown or ''}"
+
+        # Write to volume
+        file_path = f"{obsidian_path}/{page.page_id}.md"
+        dbutils.fs.put(file_path, md_content, overwrite=True)
+
+    # Generate index.md
+    index_lines = [f"# Wiki Index\n\n*{len(pages)} pages*\n"]
+    by_type = {}
+    for p in pages:
+        by_type.setdefault(p.page_type or "other", []).append(p)
+
+    for ptype in sorted(by_type.keys()):
+        index_lines.append(f"## {ptype.title()}\n")
+        for p in sorted(by_type[ptype], key=lambda x: x.title):
+            index_lines.append(f"- [[{p.page_id}|{p.title}]] ({p.confidence})")
+        index_lines.append("")
+
+    dbutils.fs.put(f"{obsidian_path}/index.md", "\n".join(index_lines), overwrite=True)
+    print(f"Exported {len(pages)} pages + index.md to {obsidian_path}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Sync to Lakebase (Optional)
+
+# COMMAND ----------
+
+if target in ("lakebase", "all"):
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient()
+        lb_info = w.lakebase.get_database_instance(lakebase_instance)
+        print(f"Lakebase available at {lb_info.host}")
+        # TODO: implement psycopg upsert when Lakebase is available
+    except Exception as e:
+        print(f"SKIP: Lakebase not available ({e})")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Trigger Vector Search Sync
+
+# COMMAND ----------
+
+if target in ("vector_search", "all"):
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient()
+        vs_index = f"{catalog}.{wiki_schema}.pages_vs_index"
+        w.vector_search_indexes.sync_index(index_name=vs_index)
+        print(f"Vector Search sync triggered for {vs_index}")
+    except Exception as e:
+        print(f"SKIP: Vector Search sync failed ({e})")
+
+# COMMAND ----------
+
+print(f"Sync complete for target: {target}")

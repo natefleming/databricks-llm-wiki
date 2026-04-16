@@ -21,13 +21,12 @@ from llm_wiki.operations.lint import WikiLinter
 from llm_wiki.operations.query import QueryEngine
 from llm_wiki.search import WikiSearch
 from llm_wiki.storage.delta import DeltaStore
-from llm_wiki.storage.lakebase import LakebaseStore
 from llm_wiki.storage.volumes import VolumeStore
 
 
 def register_tools(
     mcp: Server,
-    lakebase_store: LakebaseStore,
+    read_store: Any,
     delta_store: DeltaStore,
     volume_store: VolumeStore,
     search: WikiSearch,
@@ -38,7 +37,7 @@ def register_tools(
 
     Args:
         mcp: The MCP server instance.
-        lakebase_store: Lakebase store for fast reads.
+        read_store: Store for reads (LakebaseStore or DeltaStore).
         delta_store: Delta store for writes.
         volume_store: Volume store for source uploads.
         search: WikiSearch instance.
@@ -83,12 +82,12 @@ def register_tools(
         Returns:
             Full page content with frontmatter, or error message if not found.
         """
-        page = lakebase_store.get_page(page_id)
+        page = read_store.get_page(page_id)
         if not page:
             return f"Page '{page_id}' not found."
 
         # Get backlinks
-        backlinks = lakebase_store.get_backlinks(page_id)
+        backlinks = read_store.get_backlinks(page_id)
         backlink_text = ""
         if backlinks:
             bl_list = ", ".join(f"[[{bl.source_page_id}]]" for bl in backlinks[:10])
@@ -204,7 +203,7 @@ def register_tools(
         Returns:
             Formatted list of pages.
         """
-        pages = lakebase_store.list_pages(page_type=page_type, tag=tag, limit=limit)
+        pages = read_store.list_pages(page_type=page_type, tag=tag, limit=limit)
 
         if not pages:
             return "No pages found matching the criteria."
@@ -226,7 +225,7 @@ def register_tools(
         Returns:
             Formatted statistics summary.
         """
-        stats = lakebase_store.get_stats()
+        stats = read_store.get_stats()
 
         lines = [
             "## Wiki Statistics\n",

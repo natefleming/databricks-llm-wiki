@@ -3,7 +3,8 @@
 # MAGIC # Bronze Layer - Raw Source Ingestion
 # MAGIC
 # MAGIC Auto Loader streaming table that watches the `incoming/` UC Volume
-# MAGIC for new source files and records them in the `sources` table.
+# MAGIC for new source files. Reads files as binary to support all formats
+# MAGIC (PDF, DOCX, PPTX, images, text, markdown).
 
 # COMMAND ----------
 
@@ -11,11 +12,13 @@ import dlt
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType
 
-# Pipeline configuration
-catalog = spark.conf.get("wiki.catalog", "llm_wiki")
+# COMMAND ----------
+
+catalog = spark.conf.get("wiki.catalog", "nfleming")
 raw_schema = spark.conf.get("wiki.raw_schema", "raw_sources")
 volume_path = f"/Volumes/{catalog}/{raw_schema}/incoming"
 
+# COMMAND ----------
 
 @dlt.table(
     name="sources",
@@ -28,36 +31,30 @@ volume_path = f"/Volumes/{catalog}/{raw_schema}/incoming"
 def sources():
     """Ingest raw source files from the incoming UC Volume.
 
-    Reads text-based files (markdown, text, HTML) using Auto Loader
-    with schema inference. Each file becomes a row with its content
-    and metadata extracted.
+    Reads all file types as binary using Auto Loader. Each file becomes
+    a row with its binary content and metadata for downstream parsing.
     """
     return (
         spark.readStream.format("cloudFiles")
-        .option("cloudFiles.format", "text")
+        .option("cloudFiles.format", "binaryFile")
         .option("cloudFiles.inferColumnTypes", "true")
-        .option("wholetext", "true")
         .load(volume_path)
         .select(
             F.expr("uuid()").alias("source_id"),
-            F.input_file_name().alias("file_path"),
+            F.col("path").alias("file_path"),
             # Infer content type from file extension
-            F.when(F.input_file_name().endswith(".md"), F.lit("article"))
-            .when(F.input_file_name().endswith(".txt"), F.lit("note"))
-            .when(F.input_file_name().endswith(".html"), F.lit("article"))
-            .when(F.input_file_name().endswith(".pdf"), F.lit("paper"))
+            F.when(F.col("path").endswith(".md"), F.lit("article"))
+            .when(F.col("path").endswith(".txt"), F.lit("note"))
+            .when(F.col("path").endswith(".html"), F.lit("article"))
+            .when(F.col("path").endswith(".pdf"), F.lit("paper"))
+            .when(F.col("path").endswith(".docx"), F.lit("article"))
+            .when(F.col("path").endswith(".pptx"), F.lit("presentation"))
+            .when(F.col("path").rlike("\\.(jpg|jpeg|png)$"), F.lit("image"))
             .otherwise(F.lit("article"))
             .alias("content_type"),
-            F.col("value").alias("raw_text"),
-            F.sha2(F.col("value"), 256).alias("content_hash"),
-            # Extract basic metadata from filename
-            F.map_from_arrays(
-                F.array(F.lit("filename"), F.lit("file_size")),
-                F.array(
-                    F.element_at(F.split(F.input_file_name(), "/"), -1),
-                    F.length(F.col("value")).cast(StringType()),
-                ),
-            ).alias("metadata"),
+            F.col("content").alias("raw_bytes"),
+            F.col("length").alias("file_size"),
+            F.sha2(F.col("content"), 256).alias("content_hash"),
             F.current_timestamp().alias("ingested_at"),
         )
     )

@@ -20,13 +20,10 @@ resources:
           serving_endpoint:
             name: ${var.llm_endpoint}
             permission: CAN_QUERY
-        - name: vs_endpoint
-          serving_endpoint:
-            name: llm-wiki-vs-endpoint
-            permission: CAN_QUERY
       user_api_scopes:
         - sql
         - serving.serving-endpoints
+        - vectorsearch.vector-search-endpoints
         - vectorsearch.vector-search-indexes
         - catalog.catalogs:read
         - catalog.schemas:read

@@ -8,7 +8,7 @@ include:
 variables:
   catalog:
     description: Unity Catalog catalog name
-    default: llm_wiki
+    default: nfleming
   wiki_schema:
     description: Target schema for wiki tables
     default: wiki
@@ -17,11 +17,10 @@ variables:
     default: raw_sources
   is_development:
     description: Development mode for pipelines
-    default: true
-    type: boolean
+    default: "true"
   llm_endpoint:
     description: Foundation Model API endpoint for compilation
-    default: databricks-claude-sonnet-4
+    default: databricks-claude-sonnet-4-5
   embedding_endpoint:
     description: Embedding model endpoint
     default: databricks-gte-large-en
@@ -36,16 +35,20 @@ targets:
   dev:
     default: true
     mode: development
+    workspace:
+      profile: aws-field-eng
     variables:
       wiki_schema: wiki_${workspace.current_user.short_name}
       raw_schema: raw_sources_${workspace.current_user.short_name}
-      is_development: true
+      is_development: "true"
 
   prod:
     mode: production
+    workspace:
+      profile: aws-field-eng
     variables:
       wiki_schema: wiki
       raw_schema: raw_sources
-      is_development: false
+      is_development: "false"
     run_as:
       user_name: ${var.prod_user}

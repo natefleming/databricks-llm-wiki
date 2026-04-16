@@ -1,22 +1,23 @@
-"""Unified search combining Lakebase full-text search and Vector Search.
+"""Unified search combining full-text and Vector Search.
 
-Provides a single search interface that merges results from both backends
-using reciprocal rank fusion for optimal relevance.
+Supports Lakebase pg_trgm search when available, with Delta SQL LIKE
+as a fallback. Merges results using reciprocal rank fusion.
 
 Usage:
     from llm_wiki.search import WikiSearch
 
-    search = WikiSearch(lakebase_store, vs_index_name="llm_wiki.wiki.pages_vs_index")
+    search = WikiSearch(lakebase_store=lb, delta_store=ds)
     results = search.search("kubernetes scheduling", limit=10)
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 from databricks.sdk import WorkspaceClient
 
 from llm_wiki.log import logger
 from llm_wiki.models import SearchResult
-from llm_wiki.storage.lakebase import LakebaseStore
 
 
 class WikiSearch:
@@ -24,7 +25,8 @@ class WikiSearch:
 
     def __init__(
         self,
-        lakebase_store: LakebaseStore,
+        lakebase_store: Any | None = None,
+        delta_store: Any | None = None,
         vs_endpoint_name: str = "llm-wiki-vs-endpoint",
         vs_index_name: str = "llm_wiki.wiki.pages_vs_index",
         client: WorkspaceClient | None = None,
@@ -32,12 +34,14 @@ class WikiSearch:
         """Initialize the search engine.
 
         Args:
-            lakebase_store: LakebaseStore for full-text search.
+            lakebase_store: Optional LakebaseStore for fast full-text search.
+            delta_store: Optional DeltaStore as fallback for full-text search.
             vs_endpoint_name: Vector Search endpoint name.
             vs_index_name: Vector Search index name.
             client: Optional pre-configured WorkspaceClient.
         """
         self._lakebase = lakebase_store
+        self._delta = delta_store
         self._vs_endpoint = vs_endpoint_name
         self._vs_index = vs_index_name
         self._client = client or WorkspaceClient()
@@ -66,7 +70,7 @@ class WikiSearch:
             return self._hybrid_search(query, limit)
 
     def _fulltext_search(self, query: str, limit: int) -> list[SearchResult]:
-        """Perform full-text search via Lakebase pg_trgm/tsvector.
+        """Full-text search via Lakebase pg_trgm or Delta SQL LIKE fallback.
 
         Args:
             query: Search query.
@@ -75,14 +79,35 @@ class WikiSearch:
         Returns:
             List of SearchResult from full-text search.
         """
-        try:
-            return self._lakebase.search_pages(query, limit=limit)
-        except Exception as e:
-            logger.warning("Full-text search failed", error=str(e))
-            return []
+        # Try Lakebase first (fast pg_trgm search)
+        if self._lakebase:
+            try:
+                return self._lakebase.search_pages(query, limit=limit)
+            except Exception as e:
+                logger.warning("Lakebase search failed, trying Delta", error=str(e))
+
+        # Fallback to Delta SQL LIKE search
+        if self._delta:
+            try:
+                pages = self._delta.search_pages(query, limit=limit)
+                return [
+                    SearchResult(
+                        page_id=p.page_id,
+                        title=p.title,
+                        page_type=p.page_type.value,
+                        snippet=p.content_markdown[:200] + "..." if p.content_markdown else "",
+                        score=1.0,
+                        source="fulltext",
+                    )
+                    for p in pages
+                ]
+            except Exception as e:
+                logger.warning("Delta search failed", error=str(e))
+
+        return []
 
     def _semantic_search(self, query: str, limit: int) -> list[SearchResult]:
-        """Perform semantic search via Databricks Vector Search.
+        """Semantic search via Databricks Vector Search.
 
         Args:
             query: Search query.
@@ -151,11 +176,9 @@ def reciprocal_rank_fusion(
             rrf_score = 1.0 / (k + rank + 1)
             scores[result.page_id] = scores.get(result.page_id, 0.0) + rrf_score
 
-            # Keep the result with the longest snippet
             if result.page_id not in best_result or len(result.snippet) > len(best_result[result.page_id].snippet):
                 best_result[result.page_id] = result
 
-    # Sort by RRF score descending
     sorted_ids = sorted(scores.keys(), key=lambda pid: scores[pid], reverse=True)
 
     merged: list[SearchResult] = []
