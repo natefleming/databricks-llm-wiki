@@ -52,13 +52,19 @@ class WikiLinter:
         self._store = store
         self._config = config
 
-    def run(self) -> dict[str, list | dict | int]:
+    def run(self, check_contradictions: bool = False, contradiction_sample: int = 20) -> dict[str, list | dict | int]:
         """Run all lint checks and return a report.
+
+        Args:
+            check_contradictions: If True, also run LLM-based contradiction
+                                  detection on related page pairs (costs LLM tokens).
+            contradiction_sample: Max page-pairs to check when contradiction
+                                  detection is enabled.
 
         Returns:
             Dictionary with 'issues', 'summary', and 'total_issues'.
         """
-        logger.info("Running wiki lint checks")
+        logger.info("Running wiki lint checks", check_contradictions=check_contradictions)
         issues: list[LintIssue] = []
 
         pages = self._store.list_pages(limit=10000)
@@ -68,6 +74,9 @@ class WikiLinter:
         issues.extend(self._check_orphan_pages(pages))
         issues.extend(self._check_low_confidence(pages))
         issues.extend(self._check_missing_content(pages))
+
+        if check_contradictions:
+            issues.extend(self._check_contradictions(pages, sample=contradiction_sample))
 
         # Build summary
         summary: dict[str, int] = {}
@@ -182,5 +191,108 @@ class WikiLinter:
                     severity="warning",
                     message=f"Thin content: only {content_len} characters",
                 ))
+
+        return issues
+
+    def _check_contradictions(self, pages: list[Page], sample: int = 20) -> list[LintIssue]:
+        """LLM-based check for contradictions between linked page pairs.
+
+        To keep cost bounded, only checks pairs where page A references page B
+        via a wikilink. Samples up to `sample` such pairs (highest-confidence pages first).
+        """
+        try:
+            from databricks.sdk import WorkspaceClient
+            from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+        except Exception:
+            return []
+
+        issues: list[LintIssue] = []
+
+        # Build candidate pairs: (source_page, target_page) where source links to target
+        page_by_id = {p.page_id: p for p in pages}
+
+        # Prioritize pairs between high/medium confidence pages
+        conf_rank = {"high": 0, "medium": 1, "low": 2}
+        ranked_pages = sorted(pages, key=lambda p: conf_rank.get(p.confidence.value, 99))
+
+        pairs: list[tuple[Page, Page]] = []
+        seen: set[tuple[str, str]] = set()
+        for src in ranked_pages:
+            for target_slug in src.wikilinks:
+                target = page_by_id.get(target_slug)
+                if not target:
+                    continue
+                key = tuple(sorted([src.page_id, target_slug]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append((src, target))
+                if len(pairs) >= sample:
+                    break
+            if len(pairs) >= sample:
+                break
+
+        if not pairs:
+            return issues
+
+        try:
+            client = WorkspaceClient()
+        except Exception as e:
+            logger.warning("Cannot init client for contradiction check", error=str(e))
+            return []
+
+        model = self._config.wiki.default_model
+
+        for src, tgt in pairs:
+            system = (
+                "You are a fact-checker. Compare two wiki pages and report any "
+                "factual contradictions between them. Return STRICT JSON: "
+                '{"contradiction": true|false, "details": "brief description"}. '
+                "Report a contradiction ONLY if the pages make directly conflicting claims "
+                "about the same subject, not just different emphases."
+            )
+            user = (
+                f"Page A: [[{src.page_id}]] {src.title}\n"
+                f"{src.content_markdown[:3000]}\n\n"
+                f"---\n\n"
+                f"Page B: [[{tgt.page_id}]] {tgt.title}\n"
+                f"{tgt.content_markdown[:3000]}"
+            )
+            try:
+                resp = client.serving_endpoints.query(
+                    name=model,
+                    messages=[
+                        ChatMessage(role=ChatMessageRole.SYSTEM, content=system),
+                        ChatMessage(role=ChatMessageRole.USER, content=user),
+                    ],
+                    max_tokens=300,
+                    temperature=0.0,
+                )
+                text = ""
+                if hasattr(resp, "choices") and resp.choices:
+                    c = resp.choices[0]
+                    if hasattr(c, "message") and hasattr(c.message, "content"):
+                        text = c.message.content or ""
+                    elif isinstance(c, dict):
+                        text = c.get("message", {}).get("content", "")
+
+                import json as _json, re as _re
+                m = _re.search(r"\{.*\}", text, _re.DOTALL)
+                if not m:
+                    continue
+                try:
+                    data = _json.loads(m.group(0))
+                except Exception:
+                    continue
+
+                if data.get("contradiction"):
+                    issues.append(LintIssue(
+                        page_id=src.page_id,
+                        category="contradiction",
+                        severity="warning",
+                        message=f"Conflicts with [[{tgt.page_id}]]: {data.get('details','')[:200]}",
+                    ))
+            except Exception as e:
+                logger.warning("Contradiction check failed", pair=(src.page_id, tgt.page_id), error=str(e))
 
         return issues

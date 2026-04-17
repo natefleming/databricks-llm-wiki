@@ -78,10 +78,11 @@ def _build_state() -> dict[str, Any]:
     # Build MCP server
     from llm_wiki.app.tools import build_mcp_server
 
-    # MCP tools read from Lakebase when available, Delta otherwise
+    # MCP tools read from Lakebase when available (fast), write to Delta (source of truth)
     read_store = lakebase_store or delta_store
     mcp = build_mcp_server(
-        delta_store=read_store,  # Used by MCP tools for reads/lists
+        delta_store=read_store,       # for reads: list, get, search, stats, index
+        write_store=delta_store,      # for writes: ingest, log_activity, lint
         volume_store=volume_store,
         search=search,
         query_engine=query_engine,

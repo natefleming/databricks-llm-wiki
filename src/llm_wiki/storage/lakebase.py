@@ -350,6 +350,52 @@ class LakebaseStore:
             stats["total_backlinks"] = cur.fetchone()[0]
         return stats
 
+    def get_index(self, max_summary_chars: int = 120) -> list[dict[str, Any]]:
+        """Return a compact index of all wiki pages.
+
+        Each entry has {page_id, title, page_type, summary} where summary is
+        the first non-empty sentence from content_markdown (stripped of headings).
+        This is Karpathy's "index.md first stop" - the LLM consults this to
+        decide which pages to read in full.
+
+        Args:
+            max_summary_chars: Max chars of each one-line summary.
+
+        Returns:
+            List of {page_id, title, page_type, summary} dicts,
+            ordered by page_type then title.
+        """
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            # Grab first meaningful paragraph (skip heading + blank lines)
+            cur.execute(
+                """
+                SELECT page_id, title, page_type,
+                       substring(
+                           regexp_replace(content_markdown, '^\\s*#[^\\n]*\\n+', '', 'n'),
+                           1, %s
+                       ) AS summary
+                FROM public.pages_v
+                ORDER BY page_type, title
+                """,
+                (max_summary_chars * 3,),  # extra slack for cleanup
+            )
+            out: list[dict[str, Any]] = []
+            for r in cur.fetchall():
+                summary = (r[3] or "").replace("\n", " ").strip()
+                # Trim to first sentence or max_summary_chars
+                if "." in summary[:max_summary_chars * 2]:
+                    first_dot = summary.index(".") + 1
+                    summary = summary[:first_dot]
+                if len(summary) > max_summary_chars:
+                    summary = summary[:max_summary_chars].rsplit(" ", 1)[0] + "..."
+                out.append({
+                    "page_id": r[0],
+                    "title": r[1],
+                    "page_type": r[2] or "concept",
+                    "summary": summary,
+                })
+            return out
+
     def get_graph_data(self, center_page_id: str | None = None) -> dict[str, Any]:
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute("SELECT page_id, title, page_type FROM public.pages_v")

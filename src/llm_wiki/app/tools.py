@@ -25,30 +25,81 @@ from llm_wiki.storage.volumes import VolumeStore
 
 
 def build_mcp_server(
-    delta_store: DeltaStore,
+    delta_store: Any,
     volume_store: VolumeStore,
     search: WikiSearch,
     query_engine: Any,
     config: WikiConfig,
+    write_store: DeltaStore | None = None,
     name: str = "llm-wiki",
 ) -> FastMCP:
     """Build and return a FastMCP server with all wiki tools registered.
 
-    The server exposes 7 tools that wrap the wiki's core operations.
+    The server exposes tools that wrap the wiki's core operations.
     Mount via `app.mount("/", mcp.streamable_http_app())`.
 
     Args:
-        delta_store: Delta store for reads and writes.
+        delta_store: Read store (LakebaseStore or DeltaStore). Used for
+                     get_page, list_pages, search, stats, index.
         volume_store: Volume store for source uploads.
         search: WikiSearch instance.
         query_engine: QueryEngine instance (may be None if LLM unavailable).
         config: Wiki configuration.
+        write_store: DeltaStore for operations that modify data (ingest).
+                     Defaults to `delta_store` when not provided.
         name: Name advertised by the MCP server.
 
     Returns:
         Configured FastMCP instance (not yet mounted).
     """
+    write_store = write_store or delta_store
     mcp = FastMCP(name, stateless_http=True, json_response=True)
+
+    # ──────────────────────────────────────────────
+    # wiki_index  (Karpathy's "first stop" for the agent)
+    # ──────────────────────────────────────────────
+    @mcp.tool()
+    def wiki_index(page_type: str | None = None) -> str:
+        """Return the wiki index - the compact catalog of all pages.
+
+        **Start here before answering any question.** The index lists every
+        page in the wiki with a one-line summary, grouped by page type. Use
+        it to identify which pages are most relevant to the user's question,
+        then call `wiki_read` on the specific ones you need.
+
+        This is more reliable than `wiki_search` for broad or multi-topic
+        questions because you see the complete landscape rather than a
+        top-K vector match.
+
+        Args:
+            page_type: Optional filter (concept, entity, source, analysis, index).
+
+        Returns:
+            Markdown-formatted index, grouped by page_type.
+        """
+        if not hasattr(delta_store, "get_index"):
+            return "wiki_index: not supported by current store backend"
+
+        entries = delta_store.get_index()
+        if page_type:
+            entries = [e for e in entries if e["page_type"] == page_type]
+
+        if not entries:
+            return "Wiki is empty."
+
+        # Group by type
+        by_type: dict[str, list[dict]] = {}
+        for e in entries:
+            by_type.setdefault(e["page_type"], []).append(e)
+
+        lines = [f"# Wiki Index ({len(entries)} pages)\n"]
+        for ptype in sorted(by_type.keys()):
+            lines.append(f"\n## {ptype.title()}\n")
+            for e in sorted(by_type[ptype], key=lambda x: x["title"]):
+                summary = e["summary"] or "(no summary available)"
+                lines.append(f"- **[[{e['page_id']}]]** {e['title']} — {summary}")
+
+        return "\n".join(lines)
 
     # ──────────────────────────────────────────────
     # wiki_search
@@ -141,7 +192,7 @@ def build_mcp_server(
 
         result = ingest_source(
             volume_store=volume_store,
-            delta_store=delta_store,
+            delta_store=write_store,
             text=text,
             url=url,
             title=title,
@@ -162,38 +213,105 @@ def build_mcp_server(
     # wiki_query
     # ──────────────────────────────────────────────
     @mcp.tool()
-    def wiki_query(question: str) -> str:
+    def wiki_query(question: str, use_index: bool = True) -> str:
         """Ask a question and get a cited answer synthesized from wiki pages.
 
-        Searches the wiki, assembles relevant context, and uses the LLM to
-        synthesize an answer with [[page-slug]] citations.
+        Follows Karpathy's index-first pattern:
+          1. LLM reads the wiki index and picks relevant pages.
+          2. Those pages are loaded in full.
+          3. Answer synthesized with [[page-slug]] citations.
+
+        Falls back to vector search if the index path yields nothing.
 
         Args:
-            question: The question to answer.
+            question: The natural-language question.
+            use_index: If True (default), use index-first retrieval. If False,
+                       skip directly to vector search.
 
         Returns:
-            Answer with [[page-slug]] citations.
+            Cited answer. Includes a footer with retrieval path + pages consulted.
         """
         if query_engine is None:
             return "Query engine not available on this deployment."
-        result = query_engine.query(question)
-        return result["answer"]
+        result = query_engine.query(question, use_index=use_index)
+
+        footer = (
+            f"\n\n---\n"
+            f"_Retrieval: **{result['retrieval_path']}** | "
+            f"Pages consulted: {', '.join(f'[[{p}]]' for p in result['pages_used'][:8])}_"
+        )
+        return result["answer"] + footer
+
+    # ──────────────────────────────────────────────
+    # wiki_file_answer  (self-reinforcing loop)
+    # ──────────────────────────────────────────────
+    @mcp.tool()
+    def wiki_file_answer(question: str, answer: str, page_type: str = "analysis") -> str:
+        """File a valuable query answer back into the wiki as a new page.
+
+        Karpathy's principle: "good answers shouldn't vanish into chat history -
+        they should be filed back as new wiki pages." Use this after answering
+        a substantive question that isn't already covered by existing pages, so
+        the knowledge compounds over time.
+
+        This ingests the answer as a source document (with the question as
+        title). It will be processed by the SDP pipeline and compiled into a
+        full wiki page on the next compile run.
+
+        Args:
+            question: The original question (becomes the page title).
+            answer: The synthesized answer to file.
+            page_type: Default "analysis" since these are cross-cutting syntheses.
+
+        Returns:
+            Status with the new page slug.
+        """
+        from llm_wiki.operations.ingest import ingest_source
+
+        body = (
+            f"# {question}\n\n"
+            f"*This page was filed from a wiki_query answer. It represents "
+            f"synthesized knowledge, not raw source material.*\n\n"
+            f"{answer}"
+        )
+        result = ingest_source(
+            volume_store=volume_store,
+            delta_store=write_store,
+            text=body,
+            title=question,
+        )
+        if result["status"] == "ingested":
+            return (
+                f"Answer filed as future wiki page.\n"
+                f"- Slug: **{result['slug']}**\n"
+                f"- Queue ID: {result['queue_id']}\n"
+                f"- Page type (requested): {page_type}\n\n"
+                f"Run the compile job to materialize the page."
+            )
+        return f"Failed to file answer: {result['status']}"
 
     # ──────────────────────────────────────────────
     # wiki_lint
     # ──────────────────────────────────────────────
     @mcp.tool()
-    def wiki_lint() -> str:
+    def wiki_lint(check_contradictions: bool = False) -> str:
         """Run wiki health checks and return a report.
 
-        Checks for: stale pages, broken links, orphan pages, low confidence,
-        and thin content.
+        Fast checks (always run): stale pages, broken links, orphans,
+        low confidence, thin content.
+
+        Optional: `check_contradictions=true` runs an LLM-based check on up to
+        20 linked page pairs to identify factual conflicts. Costs LLM tokens.
+
+        Args:
+            check_contradictions: Enable LLM-based contradiction detection.
 
         Returns:
-            Formatted lint report with issues and summary.
+            Formatted lint report.
         """
-        linter = WikiLinter(delta_store, config)
-        report = linter.run()
+        # Use write_store (real DeltaStore) for lint so log_activity works
+        linter = WikiLinter(write_store, config)
+        report = linter.run(check_contradictions=check_contradictions)
 
         lines = [
             f"## Wiki Lint Report\n",
