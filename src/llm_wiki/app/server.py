@@ -142,10 +142,15 @@ async def health() -> dict[str, str]:
 # ──────────────────────────────────────────────
 
 @app.get("/api/search")
-async def api_search(q: str, limit: int = 20, request: Request = None) -> JSONResponse:
-    """Search the wiki."""
+async def api_search(
+    q: str,
+    limit: int = 20,
+    mode: str = "hybrid",
+    request: Request = None,
+) -> JSONResponse:
+    """Search the wiki. Modes: fulltext, semantic, hybrid (default)."""
     search = request.app.state.search
-    results = search.search(q, limit=limit, mode="fulltext")
+    results = search.search(q, limit=limit, mode=mode)
     return JSONResponse([r.model_dump() for r in results])
 
 

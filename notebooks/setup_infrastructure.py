@@ -166,21 +166,21 @@ from databricks.sdk import WorkspaceClient
 w = WorkspaceClient()
 
 vs_endpoint_name = "llm-wiki-vs-endpoint"
-try:
-    existing_endpoints = list(w.vector_search_endpoints.list_endpoints())
-    endpoint_names = [ep.name for ep in existing_endpoints]
 
-    if vs_endpoint_name not in endpoint_names:
-        print(f"Creating Vector Search endpoint '{vs_endpoint_name}'...")
-        w.vector_search_endpoints.create_endpoint(
-            name=vs_endpoint_name,
-            endpoint_type="STANDARD",
-        )
-        print(f"Vector Search endpoint created (may take a few minutes to become ONLINE)")
-    else:
-        print(f"Vector Search endpoint '{vs_endpoint_name}' already exists")
-except Exception as e:
-    print(f"Warning: Could not create Vector Search endpoint: {e}")
+# Note: endpoint creation is async - reaching ONLINE takes 5-10 min.
+# Use scripts/create_vector_search.py for a provisioning workflow that waits.
+existing_endpoints = list(w.vector_search_endpoints.list_endpoints())
+endpoint_names = [ep.name for ep in existing_endpoints]
+
+if vs_endpoint_name not in endpoint_names:
+    print(f"Creating Vector Search endpoint '{vs_endpoint_name}'...")
+    w.vector_search_endpoints.create_endpoint(
+        name=vs_endpoint_name,
+        endpoint_type="STANDARD",
+    )
+    print(f"Vector Search endpoint created (may take a few minutes to become ONLINE)")
+else:
+    print(f"Vector Search endpoint '{vs_endpoint_name}' already exists")
 
 # COMMAND ----------
 

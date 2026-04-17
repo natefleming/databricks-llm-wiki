@@ -54,13 +54,13 @@ def build_mcp_server(
     # wiki_search
     # ──────────────────────────────────────────────
     @mcp.tool()
-    def wiki_search(query: str, limit: int = 10, mode: str = "fulltext") -> str:
+    def wiki_search(query: str, limit: int = 10, mode: str = "hybrid") -> str:
         """Search the wiki for pages matching a query.
 
         Args:
             query: Search query string.
             limit: Maximum number of results (default 10).
-            mode: Search mode - 'fulltext', 'semantic', or 'hybrid'.
+            mode: Search mode - 'fulltext', 'semantic', or 'hybrid' (default).
 
         Returns:
             Formatted search results with page IDs, titles, and snippets.
