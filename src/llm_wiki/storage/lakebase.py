@@ -127,7 +127,7 @@ class LakebaseStore:
                 SELECT page_id, title, page_type, content_markdown, frontmatter,
                        confidence, sources, related, tags, freshness_tier,
                        content_hash, compiled_by, created_at, updated_at
-                FROM pages WHERE page_id = %s
+                FROM public.pages_v WHERE page_id = %s
                 """,
                 (page_id,),
             )
@@ -159,7 +159,7 @@ class LakebaseStore:
                 SELECT page_id, title, page_type, content_markdown, frontmatter,
                        confidence, sources, related, tags, freshness_tier,
                        content_hash, compiled_by, created_at, updated_at
-                FROM pages {where}
+                FROM public.pages_v {where}
                 ORDER BY updated_at DESC NULLS LAST
                 LIMIT %s
                 """,
@@ -172,55 +172,16 @@ class LakebaseStore:
         page: Page,
         embedding: list[float] | None = None,
     ) -> None:
-        """Insert or update a page with optional embedding."""
-        fm_json = page.frontmatter.model_dump() if page.frontmatter else {}
-        vec = _to_pgvector(embedding) if embedding else None
+        """DEPRECATED: writes now go through Delta + reverse ETL (synced table).
 
-        with self._pool.connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO pages (
-                    page_id, title, page_type, content_markdown, frontmatter,
-                    confidence, sources, related, tags, freshness_tier,
-                    content_hash, compiled_by, embedding, created_at, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s::vector, COALESCE(%s, NOW()), COALESCE(%s, NOW())
-                )
-                ON CONFLICT (page_id) DO UPDATE SET
-                    title            = EXCLUDED.title,
-                    page_type        = EXCLUDED.page_type,
-                    content_markdown = EXCLUDED.content_markdown,
-                    frontmatter      = EXCLUDED.frontmatter,
-                    confidence       = EXCLUDED.confidence,
-                    sources          = EXCLUDED.sources,
-                    related          = EXCLUDED.related,
-                    tags             = EXCLUDED.tags,
-                    freshness_tier   = EXCLUDED.freshness_tier,
-                    content_hash     = EXCLUDED.content_hash,
-                    compiled_by      = EXCLUDED.compiled_by,
-                    embedding        = COALESCE(EXCLUDED.embedding, pages.embedding),
-                    updated_at       = COALESCE(EXCLUDED.updated_at, NOW())
-                """,
-                (
-                    page.page_id,
-                    page.title,
-                    page.page_type.value,
-                    page.content_markdown,
-                    json.dumps(fm_json),
-                    page.confidence.value,
-                    page.sources,
-                    page.related,
-                    page.tags,
-                    page.freshness_tier.value,
-                    page.content_hash,
-                    page.compiled_by,
-                    vec,
-                    page.created_at,
-                    page.updated_at,
-                ),
-            )
+        This store reads from public.pages_v, a view over the synced Delta
+        mirror. Call DeltaStore.upsert_page() instead; changes propagate
+        automatically to Lakebase via the synced table pipeline.
+        """
+        raise NotImplementedError(
+            "Writes go through Delta + reverse ETL. "
+            "Use DeltaStore.upsert_page() - changes sync to Lakebase automatically."
+        )
 
     # ──────────────────────────────────────────────
     # Hybrid search (single SQL)
@@ -257,7 +218,7 @@ class LakebaseStore:
         WITH fts AS (
             SELECT page_id, title, page_type, content_markdown,
                    ts_rank_cd(fts, plainto_tsquery('english', %(q)s)) AS fts_score
-            FROM pages
+            FROM public.pages_v
             WHERE fts @@ plainto_tsquery('english', %(q)s)
             ORDER BY fts_score DESC
             LIMIT 50
@@ -265,7 +226,7 @@ class LakebaseStore:
         vec AS (
             SELECT page_id, title, page_type, content_markdown,
                    1 - (embedding <=> %(v)s::vector) AS vec_score
-            FROM pages
+            FROM public.pages_v
             WHERE embedding IS NOT NULL
             ORDER BY embedding <=> %(v)s::vector
             LIMIT 50
@@ -324,7 +285,7 @@ class LakebaseStore:
                                    'MaxWords=25, MinWords=10, MaxFragments=1') AS snippet,
                        ts_rank_cd(fts, plainto_tsquery('english', %s))
                          + 0.3 * similarity(title, %s) AS score
-                FROM pages
+                FROM public.pages_v
                 WHERE fts @@ plainto_tsquery('english', %s) OR similarity(title, %s) > 0.15
                 ORDER BY score DESC
                 LIMIT %s
@@ -348,10 +309,11 @@ class LakebaseStore:
     # ──────────────────────────────────────────────
 
     def get_backlinks(self, page_id: str) -> list[BackLink]:
+        """Read backlinks from the synced table."""
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT source_page_id, target_page_id, link_text, context_snippet "
-                "FROM backlinks WHERE target_page_id = %s",
+                "FROM wiki_nate_fleming.backlinks_synced WHERE target_page_id = %s",
                 (page_id,),
             )
             return [
@@ -363,20 +325,11 @@ class LakebaseStore:
             ]
 
     def upsert_backlinks(self, links: list[BackLink]) -> None:
-        if not links:
-            return
-        with self._pool.connection() as conn, conn.cursor() as cur:
-            for link in links:
-                cur.execute(
-                    """
-                    INSERT INTO backlinks (source_page_id, target_page_id, link_text, context_snippet)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (source_page_id, target_page_id) DO UPDATE SET
-                        link_text = EXCLUDED.link_text,
-                        context_snippet = EXCLUDED.context_snippet
-                    """,
-                    (link.source_page_id, link.target_page_id, link.link_text, link.context_snippet),
-                )
+        """DEPRECATED: writes go through Delta + reverse ETL."""
+        raise NotImplementedError(
+            "Writes go through Delta + reverse ETL. "
+            "Use DeltaStore.upsert_backlinks() - changes sync to Lakebase automatically."
+        )
 
     # ──────────────────────────────────────────────
     # Stats + graph
@@ -385,28 +338,28 @@ class LakebaseStore:
     def get_stats(self) -> dict[str, Any]:
         stats: dict[str, Any] = {}
         with self._pool.connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM pages")
+            cur.execute("SELECT COUNT(*) FROM public.pages_v")
             stats["total_pages"] = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM pages WHERE embedding IS NOT NULL")
+            cur.execute("SELECT COUNT(*) FROM public.pages_v WHERE embedding IS NOT NULL")
             stats["pages_with_embeddings"] = cur.fetchone()[0]
-            cur.execute("SELECT page_type, COUNT(*) FROM pages GROUP BY page_type")
+            cur.execute("SELECT page_type, COUNT(*) FROM public.pages_v GROUP BY page_type")
             stats["by_type"] = {r[0]: r[1] for r in cur.fetchall()}
-            cur.execute("SELECT confidence, COUNT(*) FROM pages GROUP BY confidence")
+            cur.execute("SELECT confidence, COUNT(*) FROM public.pages_v GROUP BY confidence")
             stats["by_confidence"] = {r[0]: r[1] for r in cur.fetchall()}
-            cur.execute("SELECT COUNT(*) FROM backlinks")
+            cur.execute("SELECT COUNT(*) FROM wiki_nate_fleming.backlinks_synced")
             stats["total_backlinks"] = cur.fetchone()[0]
         return stats
 
     def get_graph_data(self, center_page_id: str | None = None) -> dict[str, Any]:
         with self._pool.connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT page_id, title, page_type FROM pages")
+            cur.execute("SELECT page_id, title, page_type FROM public.pages_v")
             nodes = [
                 {"data": {"id": r[0], "label": r[1], "type": r[2] or "concept"}}
                 for r in cur.fetchall()
             ]
             node_ids = {n["data"]["id"] for n in nodes}
 
-            cur.execute("SELECT source_page_id, target_page_id FROM backlinks")
+            cur.execute("SELECT source_page_id, target_page_id FROM wiki_nate_fleming.backlinks_synced")
             edges = [
                 {"data": {"source": r[0], "target": r[1]}}
                 for r in cur.fetchall()
