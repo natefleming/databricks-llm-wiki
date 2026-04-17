@@ -1,12 +1,12 @@
 """FastAPI application serving MCP tools, web UI, and REST API.
 
 Entry point for the Databricks App. Serves:
+- MCP endpoint at /mcp (Streamable HTTP transport for Claude Code / Desktop)
 - Web UI at / (Wikipedia-style browseable interface)
 - REST API at /api/* (programmatic access)
 - Health check at /health
 
 Uses DeltaStore (Databricks SDK Statement Execution API) for all reads.
-Lakebase is optional and only used when explicitly available.
 
 Usage:
     python -m llm_wiki.app.server
@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,36 +31,79 @@ _APP_DIR = Path(__file__).parent
 _STATIC_DIR = _APP_DIR / "static"
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan: lightweight init, no blocking calls."""
+def _build_state() -> dict[str, Any]:
+    """Construct wiki stores, search, query engine, and MCP server."""
     config = get_config(os.environ.get("WIKI_CONFIG_PATH"))
 
     catalog = os.environ.get("WIKI_CATALOG", config.wiki.catalog)
     wiki_schema = os.environ.get("WIKI_SCHEMA", "wiki")
     raw_schema = os.environ.get("RAW_SCHEMA", "raw_sources")
 
-    # DeltaStore uses Statement Execution API - lightweight init, no warehouse listing
     from llm_wiki.storage.delta import DeltaStore
     from llm_wiki.storage.volumes import VolumeStore
 
     delta_store = DeltaStore(catalog=catalog, wiki_schema=wiki_schema, raw_schema=raw_schema)
     volume_store = VolumeStore(catalog=catalog, raw_schema=raw_schema, wiki_schema=wiki_schema)
 
-    # Search uses DeltaStore as fallback (no Lakebase)
     from llm_wiki.search import WikiSearch
 
     search = WikiSearch(delta_store=delta_store, vs_index_name=config.vector_search.index_name)
 
-    app.state.config = config
-    app.state.delta_store = delta_store
-    app.state.lakebase_store = None
-    app.state.volume_store = volume_store
-    app.state.search = search
+    # QueryEngine is optional (requires FMAPI access)
+    query_engine = None
+    try:
+        from llm_wiki.operations.query import QueryEngine
+        query_engine = QueryEngine(search=search, delta_store=delta_store, config=config)
+    except Exception as e:
+        logger.warning("QueryEngine unavailable", error=str(e))
 
-    logger.info("LLM Wiki server started", catalog=catalog, schema=wiki_schema)
-    yield
-    logger.info("LLM Wiki server stopped")
+    # Build MCP server
+    from llm_wiki.app.tools import build_mcp_server
+
+    mcp = build_mcp_server(
+        delta_store=delta_store,
+        volume_store=volume_store,
+        search=search,
+        query_engine=query_engine,
+        config=config,
+    )
+
+    return {
+        "config": config,
+        "delta_store": delta_store,
+        "volume_store": volume_store,
+        "search": search,
+        "query_engine": query_engine,
+        "mcp": mcp,
+    }
+
+
+# Build state at module load so MCP's streamable_http_app is available for mounting
+_state = _build_state()
+_mcp_app = _state["mcp"].streamable_http_app()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run MCP session manager alongside FastAPI lifespan."""
+    # Attach state to the app
+    app.state.config = _state["config"]
+    app.state.delta_store = _state["delta_store"]
+    app.state.lakebase_store = None
+    app.state.volume_store = _state["volume_store"]
+    app.state.search = _state["search"]
+    app.state.query_engine = _state["query_engine"]
+    app.state.mcp = _state["mcp"]
+
+    catalog = app.state.config.wiki.catalog
+    logger.info("LLM Wiki server starting", catalog=catalog)
+
+    # Run the MCP session manager inside the FastAPI lifespan
+    async with contextlib.AsyncExitStack() as stack:
+        await stack.enter_async_context(_state["mcp"].session_manager.run())
+        logger.info("MCP session manager running")
+        yield
+        logger.info("LLM Wiki server stopping")
 
 
 app = FastAPI(
@@ -85,7 +129,12 @@ def _get_store(request: Request) -> Any:
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Health check endpoint."""
-    return {"status": "healthy", "service": "llm-wiki", "backend": "delta"}
+    return {
+        "status": "healthy",
+        "service": "llm-wiki",
+        "backend": "delta",
+        "mcp": "enabled",
+    }
 
 
 # ──────────────────────────────────────────────
@@ -125,7 +174,6 @@ async def api_graph(center: str | None = None, request: Request = None) -> JSONR
         pages = delta.list_pages(limit=200)
         page_ids = {p.page_id for p in pages}
         nodes = [{"data": {"id": p.page_id, "label": p.title, "type": p.page_type.value}} for p in pages]
-        # Only include edges where both source and target exist as nodes
         edges = []
         for p in pages:
             for link in p.wikilinks:
@@ -146,6 +194,15 @@ try:
     app.include_router(web_router)
 except ImportError:
     logger.debug("Web UI routes not available")
+
+
+# ──────────────────────────────────────────────
+# Mount MCP Streamable HTTP transport at /mcp
+# ──────────────────────────────────────────────
+
+# FastMCP's streamable_http_app already serves at its own /mcp path,
+# so mount at root.
+app.mount("/", _mcp_app)
 
 
 # ──────────────────────────────────────────────

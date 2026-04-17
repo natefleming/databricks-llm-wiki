@@ -1,59 +1,65 @@
 """MCP tool definitions for the LLM Wiki server.
 
-Exposes wiki operations as MCP tools that can be used by
-Claude Code, Claude Desktop, and other MCP-compatible clients.
+Exposes wiki operations as MCP tools that can be used by Claude Code,
+Claude Desktop, and other MCP-compatible clients via Streamable HTTP
+transport at /mcp.
 
 Usage:
-    from llm_wiki.app.tools import register_tools
+    from llm_wiki.app.tools import build_mcp_server
 
-    register_tools(mcp, lakebase_store, delta_store, ...)
+    mcp = build_mcp_server(delta_store, volume_store, search, query_engine, config)
+    app.mount("/", mcp.streamable_http_app())
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from mcp.server import Server
+from mcp.server.fastmcp import FastMCP
 
 from llm_wiki.config import WikiConfig
-from llm_wiki.log import logger
 from llm_wiki.operations.lint import WikiLinter
-from llm_wiki.operations.query import QueryEngine
 from llm_wiki.search import WikiSearch
 from llm_wiki.storage.delta import DeltaStore
 from llm_wiki.storage.volumes import VolumeStore
 
 
-def register_tools(
-    mcp: Server,
-    read_store: Any,
+def build_mcp_server(
     delta_store: DeltaStore,
     volume_store: VolumeStore,
     search: WikiSearch,
-    query_engine: QueryEngine,
+    query_engine: Any,
     config: WikiConfig,
-) -> None:
-    """Register all MCP tools on the server.
+    name: str = "llm-wiki",
+) -> FastMCP:
+    """Build and return a FastMCP server with all wiki tools registered.
+
+    The server exposes 7 tools that wrap the wiki's core operations.
+    Mount via `app.mount("/", mcp.streamable_http_app())`.
 
     Args:
-        mcp: The MCP server instance.
-        read_store: Store for reads (LakebaseStore or DeltaStore).
-        delta_store: Delta store for writes.
+        delta_store: Delta store for reads and writes.
         volume_store: Volume store for source uploads.
         search: WikiSearch instance.
-        query_engine: QueryEngine instance.
+        query_engine: QueryEngine instance (may be None if LLM unavailable).
         config: Wiki configuration.
+        name: Name advertised by the MCP server.
+
+    Returns:
+        Configured FastMCP instance (not yet mounted).
     """
+    mcp = FastMCP(name, stateless_http=True, json_response=True)
 
+    # ──────────────────────────────────────────────
+    # wiki_search
+    # ──────────────────────────────────────────────
     @mcp.tool()
-    async def wiki_search(query: str, limit: int = 20, mode: str = "hybrid") -> str:
+    def wiki_search(query: str, limit: int = 10, mode: str = "fulltext") -> str:
         """Search the wiki for pages matching a query.
-
-        Uses hybrid search (full-text + semantic) by default.
 
         Args:
             query: Search query string.
-            limit: Maximum number of results (default 20).
+            limit: Maximum number of results (default 10).
             mode: Search mode - 'fulltext', 'semantic', or 'hybrid'.
 
         Returns:
@@ -72,22 +78,28 @@ def register_tools(
             lines.append(f"  (type: {r.page_type}, score: {r.score:.3f})")
         return "\n".join(lines)
 
+    # ──────────────────────────────────────────────
+    # wiki_read
+    # ──────────────────────────────────────────────
     @mcp.tool()
-    async def wiki_read(page_id: str) -> str:
+    def wiki_read(page_id: str) -> str:
         """Read a specific wiki page by its slug.
 
         Args:
-            page_id: The page slug (e.g., 'kubernetes-scheduling').
+            page_id: The page slug (e.g., 'gandalf' or 'the-one-ring').
 
         Returns:
-            Full page content with frontmatter, or error message if not found.
+            Full page content with metadata and backlinks.
         """
-        page = read_store.get_page(page_id)
+        page = delta_store.get_page(page_id)
         if not page:
             return f"Page '{page_id}' not found."
 
-        # Get backlinks
-        backlinks = read_store.get_backlinks(page_id)
+        try:
+            backlinks = delta_store.get_backlinks(page_id)
+        except Exception:
+            backlinks = []
+
         backlink_text = ""
         if backlinks:
             bl_list = ", ".join(f"[[{bl.source_page_id}]]" for bl in backlinks[:10])
@@ -102,16 +114,20 @@ def register_tools(
             f"{backlink_text}"
         )
 
+    # ──────────────────────────────────────────────
+    # wiki_ingest
+    # ──────────────────────────────────────────────
     @mcp.tool()
-    async def wiki_ingest(
+    def wiki_ingest(
         text: str | None = None,
         url: str | None = None,
         title: str | None = None,
     ) -> str:
         """Ingest a new source into the wiki.
 
-        Provide either text content or a URL to fetch. The source will be
-        uploaded to the incoming volume and enqueued for compilation.
+        Provide either text content or a URL. The source is uploaded to the
+        incoming volume and enqueued for LLM compilation. Run the compile
+        job afterwards to produce a wiki page.
 
         Args:
             text: Raw text content to ingest.
@@ -134,20 +150,23 @@ def register_tools(
         if result["status"] == "ingested":
             return (
                 f"Source ingested successfully!\n"
-                f"- **Slug**: {result['slug']}\n"
-                f"- **Title**: {result.get('title', 'untitled')}\n"
-                f"- **Path**: {result['source_path']}\n"
-                f"- **Queue ID**: {result['queue_id']}\n\n"
+                f"- Slug: {result['slug']}\n"
+                f"- Title: {result.get('title', 'untitled')}\n"
+                f"- Path: {result['source_path']}\n"
+                f"- Queue ID: {result['queue_id']}\n\n"
                 f"Run the compilation job to compile this into a wiki page."
             )
         return f"Ingestion failed: {result['status']}"
 
+    # ──────────────────────────────────────────────
+    # wiki_query
+    # ──────────────────────────────────────────────
     @mcp.tool()
-    async def wiki_query(question: str) -> str:
-        """Ask a question and get an answer synthesized from wiki pages.
+    def wiki_query(question: str) -> str:
+        """Ask a question and get a cited answer synthesized from wiki pages.
 
-        Searches the wiki, assembles relevant context, and uses the LLM
-        to synthesize a cited answer.
+        Searches the wiki, assembles relevant context, and uses the LLM to
+        synthesize an answer with [[page-slug]] citations.
 
         Args:
             question: The question to answer.
@@ -155,14 +174,19 @@ def register_tools(
         Returns:
             Answer with [[page-slug]] citations.
         """
+        if query_engine is None:
+            return "Query engine not available on this deployment."
         result = query_engine.query(question)
         return result["answer"]
 
+    # ──────────────────────────────────────────────
+    # wiki_lint
+    # ──────────────────────────────────────────────
     @mcp.tool()
-    async def wiki_lint() -> str:
+    def wiki_lint() -> str:
         """Run wiki health checks and return a report.
 
-        Checks for: stale pages, broken links, orphans, low confidence,
+        Checks for: stale pages, broken links, orphan pages, low confidence,
         and thin content.
 
         Returns:
@@ -180,9 +204,9 @@ def register_tools(
         if report["issues"]:
             lines.append("### Issues\n")
             for issue in report["issues"][:20]:
-                severity_icon = {"error": "X", "warning": "!", "info": "i"}.get(issue["severity"], "?")
+                icon = {"error": "X", "warning": "!", "info": "i"}.get(issue["severity"], "?")
                 lines.append(
-                    f"- [{severity_icon}] **{issue['page_id']}** ({issue['category']}): {issue['message']}"
+                    f"- [{icon}] **{issue['page_id']}** ({issue['category']}): {issue['message']}"
                 )
             if report["total_issues"] > 20:
                 lines.append(f"\n... and {report['total_issues'] - 20} more issues")
@@ -191,8 +215,15 @@ def register_tools(
 
         return "\n".join(lines)
 
+    # ──────────────────────────────────────────────
+    # wiki_list
+    # ──────────────────────────────────────────────
     @mcp.tool()
-    async def wiki_list(page_type: str | None = None, tag: str | None = None, limit: int = 50) -> str:
+    def wiki_list(
+        page_type: str | None = None,
+        tag: str | None = None,
+        limit: int = 50,
+    ) -> str:
         """List wiki pages with optional filtering.
 
         Args:
@@ -203,7 +234,7 @@ def register_tools(
         Returns:
             Formatted list of pages.
         """
-        pages = read_store.list_pages(page_type=page_type, tag=tag, limit=limit)
+        pages = delta_store.list_pages(page_type=page_type, tag=tag, limit=limit)
 
         if not pages:
             return "No pages found matching the criteria."
@@ -218,19 +249,23 @@ def register_tools(
 
         return "\n".join(lines)
 
+    # ──────────────────────────────────────────────
+    # wiki_stats
+    # ──────────────────────────────────────────────
     @mcp.tool()
-    async def wiki_stats() -> str:
-        """Get wiki statistics: page counts, type distribution, health.
+    def wiki_stats() -> str:
+        """Get wiki statistics: page counts, type distribution, confidence breakdown.
 
         Returns:
             Formatted statistics summary.
         """
-        stats = read_store.get_stats()
+        stats = delta_store.get_stats()
 
         lines = [
             "## Wiki Statistics\n",
             f"**Total pages**: {stats.get('total_pages', 0)}",
             f"**Total backlinks**: {stats.get('total_backlinks', 0)}",
+            f"**Pending compilations**: {stats.get('pending_compilations', 0)}",
             "",
             "### By Type",
         ]
@@ -242,3 +277,5 @@ def register_tools(
             lines.append(f"- {conf}: {count}")
 
         return "\n".join(lines)
+
+    return mcp
