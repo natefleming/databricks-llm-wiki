@@ -1,102 +1,138 @@
-"""Lakebase (Postgres) storage for fast wiki serving.
+"""Lakebase (Postgres + pgvector) storage for LLM Wiki serving.
 
-Provides sub-10ms point lookups and full-text search via pg_trgm/tsvector
-for the MCP server and web UI.
+Single backend for both full-text (tsvector + pg_trgm) and semantic (pgvector)
+search. Hybrid queries merge lexical + vector scores in one SQL statement so
+no RRF layer is needed in Python.
 
 Usage:
     from llm_wiki.storage.lakebase import LakebaseStore
 
-    store = LakebaseStore(host="...", database="wiki")
-    results = store.search_pages("kubernetes scheduling")
+    store = LakebaseStore.from_instance("llm-wiki-db", database="llm_wiki")
+    results = store.search_pages("immortal wizard", query_embedding=[...], limit=10)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
-from psycopg import sql
 from psycopg_pool import ConnectionPool
 
 from llm_wiki.log import logger
 from llm_wiki.models import BackLink, Page, SearchResult
 
 
-class LakebaseStore:
-    """Lakebase/Postgres storage backend for fast wiki serving.
+# gte-large-en produces 1024-dim vectors
+EMBEDDING_DIM = 1024
 
-    Provides full-text search via pg_trgm and tsvector indexes,
-    and sub-10ms point lookups for the MCP server and web UI.
-    """
+
+class LakebaseStore:
+    """Lakebase/Postgres backend with pgvector and tsvector for hybrid search."""
 
     def __init__(
         self,
-        host: str | None = None,
+        host: str,
+        database: str = "llm_wiki",
+        user: str = "",
+        password_fn: Any = None,
         port: int = 5432,
-        database: str = "wiki",
-        user: str | None = None,
-        password: str | None = None,
-        min_size: int = 2,
-        max_size: int = 10,
+        min_size: int = 1,
+        max_size: int = 5,
     ) -> None:
-        """Initialize the Lakebase store with a connection pool.
+        """Initialize with an OAuth-token password provider.
 
         Args:
-            host: Lakebase host. Defaults to LAKEBASE_HOST env var.
-            port: Lakebase port.
-            database: Database name.
-            user: Database user. Defaults to LAKEBASE_USER env var.
-            password: Database password. Defaults to LAKEBASE_PASSWORD env var.
-            min_size: Minimum pool connections.
-            max_size: Maximum pool connections.
+            host: Lakebase read-write DNS.
+            database: PG database name.
+            user: Postgres role (user email for personal auth).
+            password_fn: Zero-arg callable returning a fresh OAuth token.
+            port: PG port (5432).
+            min_size: Pool min connections.
+            max_size: Pool max connections.
         """
-        self._host = host or os.environ.get("LAKEBASE_HOST", "localhost")
+        self._host = host
         self._port = port
         self._database = database
-        self._user = user or os.environ.get("LAKEBASE_USER", "")
-        self._password = password or os.environ.get("LAKEBASE_PASSWORD", "")
+        self._user = user
+        self._password_fn = password_fn
+        self._token = password_fn() if password_fn else ""
+        self._token_issued_at = time.time()
+        self._pool = self._build_pool(min_size, max_size)
+        logger.info("LakebaseStore connected", host=host, database=database)
 
+    def _build_pool(self, min_size: int, max_size: int) -> ConnectionPool:
         conninfo = (
             f"host={self._host} port={self._port} dbname={self._database} "
-            f"user={self._user} password={self._password}"
+            f"user={self._user} password={self._token} sslmode=require"
         )
-        self._pool = ConnectionPool(conninfo=conninfo, min_size=min_size, max_size=max_size)
-        logger.info("Lakebase pool initialized", host=self._host, database=self._database)
+        return ConnectionPool(conninfo=conninfo, min_size=min_size, max_size=max_size, open=True)
+
+    @classmethod
+    def from_instance(
+        cls,
+        instance_name: str,
+        database: str = "llm_wiki",
+        profile: str | None = None,
+        user: str | None = None,
+    ) -> LakebaseStore:
+        """Build a store from a Databricks Lakebase instance name.
+
+        Fetches host + generates a fresh OAuth token via the Databricks SDK.
+        """
+        from databricks.sdk import WorkspaceClient
+
+        w = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+        inst = w.database.get_database_instance(name=instance_name)
+
+        if user:
+            role = user
+        else:
+            # Determine role name from current identity:
+            # - User: email address
+            # - Service principal (Databricks App): application_id UUID
+            import os
+            sp_client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
+            if sp_client_id:
+                role = sp_client_id
+            else:
+                me = w.current_user.me()
+                role = me.emails[0].value if me.emails else me.user_name
+
+        def mint_token() -> str:
+            cred = w.database.generate_database_credential(instance_names=[instance_name])
+            return cred.token
+
+        return cls(
+            host=inst.read_write_dns,
+            database=database,
+            user=role,
+            password_fn=mint_token,
+        )
 
     def close(self) -> None:
         """Close the connection pool."""
         self._pool.close()
 
     # ──────────────────────────────────────────────
-    # Page operations
+    # Page CRUD
     # ──────────────────────────────────────────────
 
     def get_page(self, page_id: str) -> Page | None:
-        """Retrieve a page by its slug.
-
-        Args:
-            page_id: The page slug identifier.
-
-        Returns:
-            Page instance or None if not found.
-        """
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT page_id, title, page_type, content_markdown, frontmatter,
-                           confidence, sources, related, tags, freshness_tier,
-                           created_at, updated_at
-                    FROM pages
-                    WHERE page_id = %s
-                    """,
-                    (page_id,),
-                )
-                row = cur.fetchone()
-                if row is None:
-                    return None
-                return self._row_to_page(row)
+        """Fetch a page by slug."""
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT page_id, title, page_type, content_markdown, frontmatter,
+                       confidence, sources, related, tags, freshness_tier,
+                       content_hash, compiled_by, created_at, updated_at
+                FROM pages WHERE page_id = %s
+                """,
+                (page_id,),
+            )
+            row = cur.fetchone()
+            return self._row_to_page(row) if row else None
 
     def list_pages(
         self,
@@ -104,270 +140,278 @@ class LakebaseStore:
         tag: str | None = None,
         limit: int = 100,
     ) -> list[Page]:
-        """List pages with optional filtering.
-
-        Args:
-            page_type: Filter by page type.
-            tag: Filter by tag.
-            limit: Maximum results.
-
-        Returns:
-            List of Page instances.
-        """
-        conditions: list[str] = []
+        """List pages with optional filters."""
+        conds: list[str] = []
         params: list[Any] = []
-
         if page_type:
-            conditions.append("page_type = %s")
+            conds.append("page_type = %s")
             params.append(page_type)
         if tag:
-            conditions.append("%s = ANY(tags)")
+            conds.append("%s = ANY(tags)")
             params.append(tag)
 
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        where = f"WHERE {' AND '.join(conds)}" if conds else ""
         params.append(limit)
 
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT page_id, title, page_type, content_markdown, frontmatter,
-                           confidence, sources, related, tags, freshness_tier,
-                           created_at, updated_at
-                    FROM pages
-                    {where}
-                    ORDER BY updated_at DESC
-                    LIMIT %s
-                    """,
-                    params,
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT page_id, title, page_type, content_markdown, frontmatter,
+                       confidence, sources, related, tags, freshness_tier,
+                       content_hash, compiled_by, created_at, updated_at
+                FROM pages {where}
+                ORDER BY updated_at DESC NULLS LAST
+                LIMIT %s
+                """,
+                params,
+            )
+            return [self._row_to_page(r) for r in cur.fetchall()]
+
+    def upsert_page(
+        self,
+        page: Page,
+        embedding: list[float] | None = None,
+    ) -> None:
+        """Insert or update a page with optional embedding."""
+        fm_json = page.frontmatter.model_dump() if page.frontmatter else {}
+        vec = _to_pgvector(embedding) if embedding else None
+
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pages (
+                    page_id, title, page_type, content_markdown, frontmatter,
+                    confidence, sources, related, tags, freshness_tier,
+                    content_hash, compiled_by, embedding, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s::vector, COALESCE(%s, NOW()), COALESCE(%s, NOW())
                 )
-                return [self._row_to_page(row) for row in cur.fetchall()]
-
-    def search_pages(self, query_text: str, limit: int = 20) -> list[SearchResult]:
-        """Full-text search using tsvector/tsquery and trigram similarity.
-
-        Combines tsvector ranking with trigram title matching for best results.
-
-        Args:
-            query_text: Search query string.
-            limit: Maximum results.
-
-        Returns:
-            List of SearchResult instances ordered by relevance.
-        """
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT page_id, title, page_type,
-                           ts_headline('english', content_markdown,
-                                       plainto_tsquery('english', %s),
-                                       'MaxWords=40, MinWords=20') AS snippet,
-                           ts_rank_cd(to_tsvector('english', content_markdown),
-                                      plainto_tsquery('english', %s)) +
-                           similarity(title, %s) AS score
-                    FROM pages
-                    WHERE to_tsvector('english', content_markdown) @@ plainto_tsquery('english', %s)
-                       OR similarity(title, %s) > 0.2
-                    ORDER BY score DESC
-                    LIMIT %s
-                    """,
-                    (query_text, query_text, query_text, query_text, query_text, limit),
-                )
-                return [
-                    SearchResult(
-                        page_id=row[0],
-                        title=row[1],
-                        page_type=row[2] or "",
-                        snippet=row[3] or "",
-                        score=float(row[4] or 0),
-                        source="fulltext",
-                    )
-                    for row in cur.fetchall()
-                ]
-
-    def upsert_page(self, page: Page) -> None:
-        """Insert or update a page.
-
-        Args:
-            page: The Page to upsert.
-        """
-        frontmatter_json = page.frontmatter.model_dump() if page.frontmatter else {}
-
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO pages (
-                        page_id, title, page_type, content_markdown, frontmatter,
-                        confidence, sources, related, tags, freshness_tier,
-                        created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (page_id) DO UPDATE SET
-                        title = EXCLUDED.title,
-                        page_type = EXCLUDED.page_type,
-                        content_markdown = EXCLUDED.content_markdown,
-                        frontmatter = EXCLUDED.frontmatter,
-                        confidence = EXCLUDED.confidence,
-                        sources = EXCLUDED.sources,
-                        related = EXCLUDED.related,
-                        tags = EXCLUDED.tags,
-                        freshness_tier = EXCLUDED.freshness_tier,
-                        updated_at = EXCLUDED.updated_at
-                    """,
-                    (
-                        page.page_id,
-                        page.title,
-                        page.page_type.value,
-                        page.content_markdown,
-                        json.dumps(frontmatter_json),
-                        page.confidence.value,
-                        page.sources,
-                        page.related,
-                        page.tags,
-                        page.freshness_tier.value,
-                        page.created_at,
-                        page.updated_at,
-                    ),
-                )
+                ON CONFLICT (page_id) DO UPDATE SET
+                    title            = EXCLUDED.title,
+                    page_type        = EXCLUDED.page_type,
+                    content_markdown = EXCLUDED.content_markdown,
+                    frontmatter      = EXCLUDED.frontmatter,
+                    confidence       = EXCLUDED.confidence,
+                    sources          = EXCLUDED.sources,
+                    related          = EXCLUDED.related,
+                    tags             = EXCLUDED.tags,
+                    freshness_tier   = EXCLUDED.freshness_tier,
+                    content_hash     = EXCLUDED.content_hash,
+                    compiled_by      = EXCLUDED.compiled_by,
+                    embedding        = COALESCE(EXCLUDED.embedding, pages.embedding),
+                    updated_at       = COALESCE(EXCLUDED.updated_at, NOW())
+                """,
+                (
+                    page.page_id,
+                    page.title,
+                    page.page_type.value,
+                    page.content_markdown,
+                    json.dumps(fm_json),
+                    page.confidence.value,
+                    page.sources,
+                    page.related,
+                    page.tags,
+                    page.freshness_tier.value,
+                    page.content_hash,
+                    page.compiled_by,
+                    vec,
+                    page.created_at,
+                    page.updated_at,
+                ),
+            )
 
     # ──────────────────────────────────────────────
-    # Backlink operations
+    # Hybrid search (single SQL)
+    # ──────────────────────────────────────────────
+
+    def search_pages(
+        self,
+        query: str,
+        query_embedding: list[float] | None = None,
+        limit: int = 20,
+        fts_weight: float = 0.4,
+        vector_weight: float = 0.6,
+    ) -> list[SearchResult]:
+        """Hybrid search: tsvector rank + pgvector cosine similarity in one SQL.
+
+        Returns results scored as weighted blend. If query_embedding is None,
+        falls back to pure full-text.
+
+        Args:
+            query: Natural-language query string.
+            query_embedding: Pre-computed 1024-dim embedding for semantic part.
+            limit: Max results.
+            fts_weight: Weight for lexical match score (0..1).
+            vector_weight: Weight for cosine-similarity score (0..1).
+
+        Returns:
+            SearchResult list ordered by blended score descending.
+        """
+        if query_embedding is None:
+            return self._fulltext_only(query, limit)
+
+        vec = _to_pgvector(query_embedding)
+        sql = """
+        WITH fts AS (
+            SELECT page_id, title, page_type, content_markdown,
+                   ts_rank_cd(fts, plainto_tsquery('english', %(q)s)) AS fts_score
+            FROM pages
+            WHERE fts @@ plainto_tsquery('english', %(q)s)
+            ORDER BY fts_score DESC
+            LIMIT 50
+        ),
+        vec AS (
+            SELECT page_id, title, page_type, content_markdown,
+                   1 - (embedding <=> %(v)s::vector) AS vec_score
+            FROM pages
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> %(v)s::vector
+            LIMIT 50
+        ),
+        merged AS (
+            SELECT
+                COALESCE(f.page_id, v.page_id)         AS page_id,
+                COALESCE(f.title, v.title)             AS title,
+                COALESCE(f.page_type, v.page_type)     AS page_type,
+                COALESCE(f.content_markdown, v.content_markdown) AS content_markdown,
+                COALESCE(f.fts_score, 0)               AS fts_score,
+                COALESCE(v.vec_score, 0)               AS vec_score
+            FROM fts f
+            FULL OUTER JOIN vec v ON f.page_id = v.page_id
+        )
+        SELECT
+            page_id,
+            title,
+            page_type,
+            ts_headline('english', content_markdown,
+                        plainto_tsquery('english', %(q)s),
+                        'MaxWords=25, MinWords=10, MaxFragments=1') AS snippet,
+            (%(wf)s * fts_score + %(wv)s * vec_score) AS score
+        FROM merged
+        ORDER BY score DESC
+        LIMIT %(lim)s
+        """
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, {
+                "q": query, "v": vec,
+                "wf": fts_weight, "wv": vector_weight,
+                "lim": limit,
+            })
+            rows = cur.fetchall()
+
+        return [
+            SearchResult(
+                page_id=r[0],
+                title=r[1] or "",
+                page_type=r[2] or "concept",
+                snippet=r[3] or "",
+                score=float(r[4] or 0),
+                source="hybrid",
+            )
+            for r in rows
+        ]
+
+    def _fulltext_only(self, query: str, limit: int) -> list[SearchResult]:
+        """Full-text only path (used when no query embedding supplied)."""
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT page_id, title, page_type,
+                       ts_headline('english', content_markdown,
+                                   plainto_tsquery('english', %s),
+                                   'MaxWords=25, MinWords=10, MaxFragments=1') AS snippet,
+                       ts_rank_cd(fts, plainto_tsquery('english', %s))
+                         + 0.3 * similarity(title, %s) AS score
+                FROM pages
+                WHERE fts @@ plainto_tsquery('english', %s) OR similarity(title, %s) > 0.15
+                ORDER BY score DESC
+                LIMIT %s
+                """,
+                (query, query, query, query, query, limit),
+            )
+            return [
+                SearchResult(
+                    page_id=r[0],
+                    title=r[1] or "",
+                    page_type=r[2] or "concept",
+                    snippet=r[3] or "",
+                    score=float(r[4] or 0),
+                    source="fulltext",
+                )
+                for r in cur.fetchall()
+            ]
+
+    # ──────────────────────────────────────────────
+    # Backlinks
     # ──────────────────────────────────────────────
 
     def get_backlinks(self, page_id: str) -> list[BackLink]:
-        """Get all pages linking to the given page.
-
-        Args:
-            page_id: Target page slug.
-
-        Returns:
-            List of BackLink instances.
-        """
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT source_page_id, target_page_id, link_text, context_snippet
-                    FROM backlinks
-                    WHERE target_page_id = %s
-                    """,
-                    (page_id,),
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT source_page_id, target_page_id, link_text, context_snippet "
+                "FROM backlinks WHERE target_page_id = %s",
+                (page_id,),
+            )
+            return [
+                BackLink(
+                    source_page_id=r[0], target_page_id=r[1],
+                    link_text=r[2] or "", context_snippet=r[3] or "",
                 )
-                return [
-                    BackLink(
-                        source_page_id=row[0],
-                        target_page_id=row[1],
-                        link_text=row[2] or "",
-                        context_snippet=row[3] or "",
-                    )
-                    for row in cur.fetchall()
-                ]
+                for r in cur.fetchall()
+            ]
 
     def upsert_backlinks(self, links: list[BackLink]) -> None:
-        """Insert or update backlinks.
-
-        Args:
-            links: List of BackLink instances to upsert.
-        """
         if not links:
             return
-
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                for link in links:
-                    cur.execute(
-                        """
-                        INSERT INTO backlinks (source_page_id, target_page_id, link_text, context_snippet)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (source_page_id, target_page_id) DO UPDATE SET
-                            link_text = EXCLUDED.link_text,
-                            context_snippet = EXCLUDED.context_snippet
-                        """,
-                        (link.source_page_id, link.target_page_id, link.link_text, link.context_snippet),
-                    )
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            for link in links:
+                cur.execute(
+                    """
+                    INSERT INTO backlinks (source_page_id, target_page_id, link_text, context_snippet)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (source_page_id, target_page_id) DO UPDATE SET
+                        link_text = EXCLUDED.link_text,
+                        context_snippet = EXCLUDED.context_snippet
+                    """,
+                    (link.source_page_id, link.target_page_id, link.link_text, link.context_snippet),
+                )
 
     # ──────────────────────────────────────────────
-    # Statistics
+    # Stats + graph
     # ──────────────────────────────────────────────
 
     def get_stats(self) -> dict[str, Any]:
-        """Get wiki statistics.
-
-        Returns:
-            Dictionary with page counts, type distribution, etc.
-        """
         stats: dict[str, Any] = {}
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM pages")
-                stats["total_pages"] = cur.fetchone()[0]
-
-                cur.execute("SELECT page_type, COUNT(*) FROM pages GROUP BY page_type")
-                stats["by_type"] = {row[0]: row[1] for row in cur.fetchall()}
-
-                cur.execute("SELECT confidence, COUNT(*) FROM pages GROUP BY confidence")
-                stats["by_confidence"] = {row[0]: row[1] for row in cur.fetchall()}
-
-                cur.execute("SELECT COUNT(*) FROM backlinks")
-                stats["total_backlinks"] = cur.fetchone()[0]
-
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM pages")
+            stats["total_pages"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM pages WHERE embedding IS NOT NULL")
+            stats["pages_with_embeddings"] = cur.fetchone()[0]
+            cur.execute("SELECT page_type, COUNT(*) FROM pages GROUP BY page_type")
+            stats["by_type"] = {r[0]: r[1] for r in cur.fetchall()}
+            cur.execute("SELECT confidence, COUNT(*) FROM pages GROUP BY confidence")
+            stats["by_confidence"] = {r[0]: r[1] for r in cur.fetchall()}
+            cur.execute("SELECT COUNT(*) FROM backlinks")
+            stats["total_backlinks"] = cur.fetchone()[0]
         return stats
 
-    # ──────────────────────────────────────────────
-    # Graph data (for Cytoscape.js)
-    # ──────────────────────────────────────────────
+    def get_graph_data(self, center_page_id: str | None = None) -> dict[str, Any]:
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT page_id, title, page_type FROM pages")
+            nodes = [
+                {"data": {"id": r[0], "label": r[1], "type": r[2] or "concept"}}
+                for r in cur.fetchall()
+            ]
+            node_ids = {n["data"]["id"] for n in nodes}
 
-    def get_graph_data(self, center_page_id: str | None = None, hops: int = 2) -> dict[str, Any]:
-        """Get graph data for knowledge graph visualization.
-
-        Args:
-            center_page_id: Optional center page for neighborhood graph.
-            hops: Number of hops from center (only used when center_page_id is set).
-
-        Returns:
-            Dictionary with 'nodes' and 'edges' lists for Cytoscape.js.
-        """
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                if center_page_id:
-                    # Neighborhood graph: get pages within N hops
-                    cur.execute(
-                        """
-                        WITH RECURSIVE neighborhood AS (
-                            SELECT %s AS page_id, 0 AS depth
-                            UNION
-                            SELECT CASE
-                                WHEN b.source_page_id = n.page_id THEN b.target_page_id
-                                ELSE b.source_page_id
-                            END, n.depth + 1
-                            FROM neighborhood n
-                            JOIN backlinks b ON b.source_page_id = n.page_id
-                                             OR b.target_page_id = n.page_id
-                            WHERE n.depth < %s
-                        )
-                        SELECT DISTINCT p.page_id, p.title, p.page_type
-                        FROM neighborhood n
-                        JOIN pages p ON p.page_id = n.page_id
-                        """,
-                        (center_page_id, hops),
-                    )
-                else:
-                    cur.execute("SELECT page_id, title, page_type FROM pages")
-
-                nodes = [
-                    {"data": {"id": row[0], "label": row[1], "type": row[2]}}
-                    for row in cur.fetchall()
-                ]
-                node_ids = {n["data"]["id"] for n in nodes}
-
-                cur.execute("SELECT source_page_id, target_page_id FROM backlinks")
-                edges = [
-                    {"data": {"source": row[0], "target": row[1]}}
-                    for row in cur.fetchall()
-                    if row[0] in node_ids and row[1] in node_ids
-                ]
-
+            cur.execute("SELECT source_page_id, target_page_id FROM backlinks")
+            edges = [
+                {"data": {"source": r[0], "target": r[1]}}
+                for r in cur.fetchall()
+                if r[0] in node_ids and r[1] in node_ids
+            ]
         return {"nodes": nodes, "edges": edges}
 
     # ──────────────────────────────────────────────
@@ -376,14 +420,15 @@ class LakebaseStore:
 
     @staticmethod
     def _row_to_page(row: tuple) -> Page:
-        """Convert a database row to a Page model."""
-        frontmatter_raw = row[4]
-        if isinstance(frontmatter_raw, str):
-            frontmatter_raw = json.loads(frontmatter_raw)
-
+        fm_raw = row[4]
+        if isinstance(fm_raw, str):
+            try:
+                fm_raw = json.loads(fm_raw)
+            except Exception:
+                fm_raw = {}
         return Page(
             page_id=row[0],
-            title=row[1],
+            title=row[1] or "",
             page_type=row[2] or "concept",
             content_markdown=row[3] or "",
             confidence=row[5] or "low",
@@ -391,6 +436,13 @@ class LakebaseStore:
             related=row[7] or [],
             tags=row[8] or [],
             freshness_tier=row[9] or "monthly",
-            created_at=row[10],
-            updated_at=row[11],
+            content_hash=row[10] or "",
+            compiled_by=row[11] or "",
+            created_at=row[12],
+            updated_at=row[13],
         )
+
+
+def _to_pgvector(values: list[float]) -> str:
+    """Convert a float list to the pgvector string literal format."""
+    return "[" + ",".join(f"{float(x):.8f}" for x in values) + "]"

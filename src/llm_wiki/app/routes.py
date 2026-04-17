@@ -26,21 +26,32 @@ def _get_store(request: Request):
     return request.app.state.lakebase_store or request.app.state.delta_store
 
 
-def _render_markdown(content: str) -> str:
+def _render_markdown(content: str, existing_page_ids: set[str] | None = None) -> str:
     """Render markdown to HTML, converting [[wikilinks]] to <a> tags.
+
+    Links to pages that exist get the `wikilink` CSS class (blue).
+    Links to missing pages get the `redlink` class (styled differently)
+    and a `title` tooltip explaining the page doesn't exist.
 
     Args:
         content: Markdown content.
+        existing_page_ids: Set of known page IDs. If None, all links render as wikilinks.
 
     Returns:
         HTML string.
     """
     import re
 
-    # Convert [[slug]] and [[slug|text]] to HTML links
+    existing = existing_page_ids or set()
+
     def wikilink_replace(match: re.Match) -> str:
         slug = match.group(1)
         display = match.group(3) if match.group(3) else slug.replace("-", " ").title()
+        if existing_page_ids is not None and slug not in existing:
+            return (
+                f'<a href="/page/{slug}" class="redlink" '
+                f'title="Red link: page &quot;{slug}&quot; does not exist yet">{display}</a>'
+            )
         return f'<a href="/page/{slug}" class="wikilink">{display}</a>'
 
     content = re.sub(
@@ -49,13 +60,19 @@ def _render_markdown(content: str) -> str:
         content,
     )
 
-    # Render markdown to HTML
-    html = markdown.markdown(
+    return markdown.markdown(
         content,
         extensions=["fenced_code", "tables", "toc"],
     )
 
-    return html
+
+def _fetch_page_ids(store) -> set[str]:
+    """Fetch the set of all existing page_ids (cached per-request via store)."""
+    try:
+        pages = store.list_pages(limit=5000)
+        return {p.page_id for p in pages}
+    except Exception:
+        return set()
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -88,7 +105,8 @@ async def page_view(page_id: str, request: Request) -> HTMLResponse:
             "backlinks": [],
         })
 
-    content_html = _render_markdown(page.content_markdown)
+    existing_ids = _fetch_page_ids(store)
+    content_html = _render_markdown(page.content_markdown, existing_page_ids=existing_ids)
     try:
         backlinks = store.get_backlinks(page_id)
     except Exception:

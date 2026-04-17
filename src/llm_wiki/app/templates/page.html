@@ -65,10 +65,22 @@
     </aside>
     {% else %}
     <div class="page-not-found">
-        <h1>Page Not Found</h1>
-        <p>The page <code>{{ page_id }}</code> does not exist yet.</p>
-        <p>This could be a <span class="redlink">red link</span> waiting to be created.</p>
-        <a href="/" class="btn">Back to Home</a>
+        <h1>Red Link</h1>
+        <p>The page <code>{{ page_id }}</code> <strong>does not exist yet</strong>.</p>
+        <p>
+            In wiki terminology, this is a <span class="redlink">red link</span> &mdash; a reference
+            to a concept that has been mentioned in other pages but not yet compiled into its own page.
+            Red links identify knowledge gaps in the wiki.
+        </p>
+        <p>
+            <strong>To fill this gap:</strong> ingest a source about <code>{{ page_id.replace('-', ' ') }}</code>
+            using the <code>wiki_ingest</code> MCP tool, or drop a markdown/PDF file into the
+            <code>incoming/</code> volume and run the pipeline.
+        </p>
+        <div style="margin-top: 1.5rem; display: flex; gap: 0.5rem;">
+            <a href="/" class="btn">Back to Home</a>
+            <a href="/search?q={{ page_id.replace('-', ' ') }}" class="btn">Search for related pages</a>
+        </div>
     </div>
     {% endif %}
 </div>

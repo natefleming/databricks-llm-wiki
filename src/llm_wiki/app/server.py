@@ -38,6 +38,8 @@ def _build_state() -> dict[str, Any]:
     catalog = os.environ.get("WIKI_CATALOG", config.wiki.catalog)
     wiki_schema = os.environ.get("WIKI_SCHEMA", "wiki")
     raw_schema = os.environ.get("RAW_SCHEMA", "raw_sources")
+    lakebase_instance = os.environ.get("LAKEBASE_INSTANCE", "DONOTDELETE-vibe-coding-workshop-lakebase")
+    lakebase_database = os.environ.get("LAKEBASE_DATABASE", "llm_wiki")
 
     from llm_wiki.storage.delta import DeltaStore
     from llm_wiki.storage.volumes import VolumeStore
@@ -45,9 +47,25 @@ def _build_state() -> dict[str, Any]:
     delta_store = DeltaStore(catalog=catalog, wiki_schema=wiki_schema, raw_schema=raw_schema)
     volume_store = VolumeStore(catalog=catalog, raw_schema=raw_schema, wiki_schema=wiki_schema)
 
+    # Lakebase is the primary read store (hybrid pgvector + tsvector search)
+    lakebase_store = None
+    try:
+        from llm_wiki.storage.lakebase import LakebaseStore
+        lakebase_store = LakebaseStore.from_instance(
+            instance_name=lakebase_instance,
+            database=lakebase_database,
+        )
+        logger.info("Lakebase connected", instance=lakebase_instance, database=lakebase_database)
+    except Exception as e:
+        logger.warning("Lakebase unavailable, Delta fallback only", error=str(e))
+
     from llm_wiki.search import WikiSearch
 
-    search = WikiSearch(delta_store=delta_store, vs_index_name=config.vector_search.index_name)
+    search = WikiSearch(
+        lakebase_store=lakebase_store,
+        delta_store=delta_store,
+        embedding_endpoint=config.wiki.embedding_model,
+    )
 
     # QueryEngine is optional (requires FMAPI access)
     query_engine = None
@@ -60,8 +78,10 @@ def _build_state() -> dict[str, Any]:
     # Build MCP server
     from llm_wiki.app.tools import build_mcp_server
 
+    # MCP tools read from Lakebase when available, Delta otherwise
+    read_store = lakebase_store or delta_store
     mcp = build_mcp_server(
-        delta_store=delta_store,
+        delta_store=read_store,  # Used by MCP tools for reads/lists
         volume_store=volume_store,
         search=search,
         query_engine=query_engine,
@@ -71,6 +91,7 @@ def _build_state() -> dict[str, Any]:
     return {
         "config": config,
         "delta_store": delta_store,
+        "lakebase_store": lakebase_store,
         "volume_store": volume_store,
         "search": search,
         "query_engine": query_engine,
@@ -89,7 +110,7 @@ async def lifespan(app: FastAPI):
     # Attach state to the app
     app.state.config = _state["config"]
     app.state.delta_store = _state["delta_store"]
-    app.state.lakebase_store = None
+    app.state.lakebase_store = _state["lakebase_store"]
     app.state.volume_store = _state["volume_store"]
     app.state.search = _state["search"]
     app.state.query_engine = _state["query_engine"]
@@ -127,12 +148,13 @@ def _get_store(request: Request) -> Any:
 # ──────────────────────────────────────────────
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health(request: Request) -> dict[str, str]:
     """Health check endpoint."""
+    backend = "lakebase" if request.app.state.lakebase_store else "delta"
     return {
         "status": "healthy",
         "service": "llm-wiki",
-        "backend": "delta",
+        "backend": backend,
         "mcp": "enabled",
     }
 

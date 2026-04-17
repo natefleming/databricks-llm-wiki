@@ -1,13 +1,15 @@
-"""Unified search combining full-text and Vector Search.
+"""Unified wiki search using Lakebase with pgvector + tsvector.
 
-Supports Lakebase pg_trgm search when available, with Delta SQL LIKE
-as a fallback. Merges results using reciprocal rank fusion.
+Hybrid search is a single SQL query against Lakebase; no Python-side RRF
+merge is needed. Embeddings for queries are computed via the Databricks
+Foundation Model API (gte-large-en by default). If Lakebase is unavailable,
+falls back to DeltaStore's SQL LIKE search (fulltext only, no embeddings).
 
 Usage:
     from llm_wiki.search import WikiSearch
 
-    search = WikiSearch(lakebase_store=lb, delta_store=ds)
-    results = search.search("kubernetes scheduling", limit=10)
+    search = WikiSearch(lakebase_store=lb, delta_store=delta)
+    results = search.search("immortal wizard", mode="hybrid")
 """
 
 from __future__ import annotations
@@ -21,29 +23,27 @@ from llm_wiki.models import SearchResult
 
 
 class WikiSearch:
-    """Unified wiki search combining full-text and semantic search."""
+    """Hybrid search backed by Lakebase (pgvector + tsvector)."""
 
     def __init__(
         self,
         lakebase_store: Any | None = None,
         delta_store: Any | None = None,
-        vs_endpoint_name: str = "llm-wiki-vs-endpoint",
-        vs_index_name: str = "llm_wiki.wiki.pages_vs_index",
+        embedding_endpoint: str = "databricks-gte-large-en",
         client: WorkspaceClient | None = None,
+        **_legacy,
     ) -> None:
         """Initialize the search engine.
 
         Args:
-            lakebase_store: Optional LakebaseStore for fast full-text search.
-            delta_store: Optional DeltaStore as fallback for full-text search.
-            vs_endpoint_name: Vector Search endpoint name.
-            vs_index_name: Vector Search index name.
+            lakebase_store: LakebaseStore for hybrid search. Primary backend.
+            delta_store: DeltaStore fallback for fulltext-only when Lakebase is down.
+            embedding_endpoint: FMAPI endpoint name for query embedding.
             client: Optional pre-configured WorkspaceClient.
         """
         self._lakebase = lakebase_store
         self._delta = delta_store
-        self._vs_endpoint = vs_endpoint_name
-        self._vs_index = vs_index_name
+        self._embedding_endpoint = embedding_endpoint
         self._client = client or WorkspaceClient()
 
     def search(
@@ -52,140 +52,94 @@ class WikiSearch:
         limit: int = 20,
         mode: str = "hybrid",
     ) -> list[SearchResult]:
-        """Search the wiki using the specified mode.
+        """Search the wiki.
 
         Args:
-            query: Search query string.
-            limit: Maximum results.
-            mode: Search mode - 'fulltext', 'semantic', or 'hybrid'.
-
-        Returns:
-            List of SearchResult instances ordered by relevance.
+            query: Query string.
+            limit: Max results.
+            mode: 'fulltext' (no embeddings), 'semantic' (vector only),
+                  or 'hybrid' (both, blended in SQL). Default hybrid.
         """
+        if self._lakebase is None:
+            return self._delta_fallback(query, limit)
+
         if mode == "fulltext":
-            return self._fulltext_search(query, limit)
-        elif mode == "semantic":
-            return self._semantic_search(query, limit)
-        else:
-            return self._hybrid_search(query, limit)
+            return self._lakebase.search_pages(query, query_embedding=None, limit=limit)
 
-    def _fulltext_search(self, query: str, limit: int) -> list[SearchResult]:
-        """Full-text search via Lakebase pg_trgm or Delta SQL LIKE fallback.
-
-        Args:
-            query: Search query.
-            limit: Maximum results.
-
-        Returns:
-            List of SearchResult from full-text search.
-        """
-        # Try Lakebase first (fast pg_trgm search)
-        if self._lakebase:
-            try:
-                return self._lakebase.search_pages(query, limit=limit)
-            except Exception as e:
-                logger.warning("Lakebase search failed, trying Delta", error=str(e))
-
-        # Fallback to Delta SQL LIKE search
-        if self._delta:
-            try:
-                pages = self._delta.search_pages(query, limit=limit)
-                return [
-                    SearchResult(
-                        page_id=p.page_id,
-                        title=p.title,
-                        page_type=p.page_type.value,
-                        snippet=p.content_markdown[:200] + "..." if p.content_markdown else "",
-                        score=1.0,
-                        source="fulltext",
-                    )
-                    for p in pages
-                ]
-            except Exception as e:
-                logger.warning("Delta search failed", error=str(e))
-
-        return []
-
-    def _semantic_search(self, query: str, limit: int) -> list[SearchResult]:
-        """Semantic search via Databricks Vector Search.
-
-        Args:
-            query: Search query.
-            limit: Maximum results.
-
-        Returns:
-            List of SearchResult from vector search.
-        """
+        # Semantic or hybrid -> need query embedding
         try:
-            response = self._client.vector_search_indexes.query(
-                index_name=self._vs_index,
-                columns=["page_id", "title", "page_type", "content_markdown"],
-                query_text=query,
-                num_results=limit,
-            )
-
-            results: list[SearchResult] = []
-            if response.result and response.result.data_array:
-                for row in response.result.data_array:
-                    results.append(SearchResult.from_vs_result(row))
-
-            return results
-
+            qvec = self._embed_query(query)
         except Exception as e:
-            logger.warning("Semantic search failed", error=str(e))
+            logger.warning("Query embedding failed, falling back to fulltext", error=str(e))
+            return self._lakebase.search_pages(query, query_embedding=None, limit=limit)
+
+        if mode == "semantic":
+            return self._lakebase.search_pages(
+                query, query_embedding=qvec, limit=limit,
+                fts_weight=0.0, vector_weight=1.0,
+            )
+        # hybrid default
+        return self._lakebase.search_pages(
+            query, query_embedding=qvec, limit=limit,
+            fts_weight=0.4, vector_weight=0.6,
+        )
+
+    def _embed_query(self, query: str) -> list[float]:
+        """Embed a query string via FMAPI."""
+        response = self._client.serving_endpoints.query(
+            name=self._embedding_endpoint,
+            input=[query],
+        )
+        item = response.data[0]
+        vec = item.embedding if hasattr(item, "embedding") else item["embedding"]
+        return list(vec)
+
+    def _delta_fallback(self, query: str, limit: int) -> list[SearchResult]:
+        """Fallback to Delta SQL LIKE when Lakebase is not configured."""
+        if self._delta is None:
+            return []
+        try:
+            pages = self._delta.search_pages(query, limit=limit)
+            return [
+                SearchResult(
+                    page_id=p.page_id, title=p.title,
+                    page_type=p.page_type.value,
+                    snippet=(p.content_markdown[:200] + "...") if p.content_markdown else "",
+                    score=1.0, source="fulltext",
+                )
+                for p in pages
+            ]
+        except Exception as e:
+            logger.warning("Delta fallback search failed", error=str(e))
             return []
 
-    def _hybrid_search(self, query: str, limit: int) -> list[SearchResult]:
-        """Combine full-text and semantic search using reciprocal rank fusion.
 
-        Args:
-            query: Search query.
-            limit: Maximum results.
-
-        Returns:
-            Merged and re-ranked list of SearchResult instances.
-        """
-        ft_results = self._fulltext_search(query, limit=limit)
-        vs_results = self._semantic_search(query, limit=limit)
-
-        return reciprocal_rank_fusion(ft_results, vs_results, limit=limit)
-
-
+# Legacy reciprocal_rank_fusion kept for any remaining callers (e.g. tests)
 def reciprocal_rank_fusion(
     *result_lists: list[SearchResult],
     k: int = 60,
     limit: int = 20,
 ) -> list[SearchResult]:
-    """Merge multiple ranked result lists using Reciprocal Rank Fusion.
+    """Merge ranked lists via Reciprocal Rank Fusion.
 
-    RRF score = sum(1 / (k + rank_i)) across all lists.
-
-    Args:
-        result_lists: Variable number of ranked result lists.
-        k: RRF constant (default 60, standard in literature).
-        limit: Maximum results to return.
-
-    Returns:
-        Merged and re-ranked list of SearchResult instances.
+    Retained for unit tests and edge cases where multiple ranked lists must
+    be merged outside a SQL hybrid query.
     """
     scores: dict[str, float] = {}
-    best_result: dict[str, SearchResult] = {}
+    best: dict[str, SearchResult] = {}
 
     for results in result_lists:
         for rank, result in enumerate(results):
-            rrf_score = 1.0 / (k + rank + 1)
-            scores[result.page_id] = scores.get(result.page_id, 0.0) + rrf_score
+            rrf = 1.0 / (k + rank + 1)
+            scores[result.page_id] = scores.get(result.page_id, 0.0) + rrf
+            if result.page_id not in best or len(result.snippet) > len(best[result.page_id].snippet):
+                best[result.page_id] = result
 
-            if result.page_id not in best_result or len(result.snippet) > len(best_result[result.page_id].snippet):
-                best_result[result.page_id] = result
-
-    sorted_ids = sorted(scores.keys(), key=lambda pid: scores[pid], reverse=True)
-
+    ordered = sorted(scores.keys(), key=lambda pid: scores[pid], reverse=True)
     merged: list[SearchResult] = []
-    for pid in sorted_ids[:limit]:
-        result = best_result[pid]
-        result.score = scores[pid]
-        result.source = "hybrid"
-        merged.append(result)
-
+    for pid in ordered[:limit]:
+        r = best[pid]
+        r.score = scores[pid]
+        r.source = "hybrid"
+        merged.append(r)
     return merged

@@ -46,7 +46,17 @@ body {
 a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration: underline; }
 a.wikilink { color: var(--accent); font-weight: 500; }
-a.redlink { color: var(--redlink); }
+a.redlink {
+    color: var(--redlink);
+    text-decoration: underline;
+    text-decoration-style: dashed;
+    text-decoration-color: var(--redlink);
+    opacity: 0.75;
+}
+a.redlink:hover {
+    opacity: 1;
+    cursor: help;
+}
 
 /* Navbar */
 .navbar {
